@@ -1,0 +1,298 @@
+
+
+```{r setup_packages, message=FALSE}
+
+# Required packages
+required_packages <- c("remstats", "remstimate", "dplyr", "ggplot2", "plotly", "momentuHMM", "remulate")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(paste("Package", pkg, "is required but not installed."))
+  } else {
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+
+```{r init_parameters}
+# Initialize storage objects
+all_tables_simple <- list()
+BICs_simple <- numeric()
+all_tables_State <- list()
+BICs_State <- numeric()
+all_tables_Interaction <- list()
+BICs_Interaction <- numeric()
+SAVE_FIT_State <- list()
+SAVE_FIT_Interaction <- list()
+HMM_TR <- list()
+accuracies <- numeric()
+
+# Initialization
+set.seed(1234)
+
+# Parameters
+n_events <- 3000
+transition_probs <- matrix(c(0.99, 0.01,
+                             0.02, 0.98), nrow = 2, byrow = TRUE)
+initial_probs <- c(1, 0)
+m <- 2  # number of hidden states
+nstates <- m
+
+```
+
+
+
+
+```{r Main Loop}
+for (iter in 1:2) {
+  cat("Iteration:", iter, "\n")
+
+  n_actors <- 15
+  actors <- 1:n_actors
+
+  attr_actors <- data.frame(
+    name = actors,
+    time = rep(0, n_actors),
+    sex = sample(0:1, n_actors, replace = TRUE),
+    age = sample(0:1, n_actors, replace = TRUE)
+  )
+
+  repeat {
+    # Simulate hidden states
+    hidden_states <- numeric(n_events)
+    for (t in seq_len(n_events)) {
+      if (t == 1) {
+        hidden_states[t] <- sample(m, 1, prob = initial_probs)
+      } else {
+        hidden_states[t] <- sample(m, 1, prob = transition_probs[hidden_states[t - 1], ])
+      }
+    }
+
+    # Identify change points in states
+    state_runs <- rle(hidden_states)
+    state_lengths <- state_runs$lengths
+    
+    # Break if no state segment has length 1
+    if (!1 %in% state_lengths) break
+  }
+
+  state_values <- state_runs$values
+
+  # Effects
+  effects1 <- ~
+    remulate::baseline(-8) +
+    remulate::difference(0.3, "sex", attr_actors, scaling = "std") +
+    remulate::difference(0.4, "age", attr_actors, scaling = "std") +
+    remulate::outdegreeReceiver(0.2, scaling = "std") +
+    remulate::inertia(0.2, scaling = "std")
+
+  effects2 <- ~
+    remulate::baseline(-6.5) +
+    remulate::difference(0.3, "sex", attr_actors, scaling = "std") +
+    remulate::difference(0.4, "age", attr_actors, scaling = "std") +
+    remulate::outdegreeReceiver(0.5, scaling = "std") +
+    remulate::inertia(0.4, scaling = "std")
+
+  # Initialize first event history
+  initialREH <- data.frame(time = 1, sender = 1, receiver = 1)
+
+  all_events <- NULL
+
+  # Run segment-wise simulation
+  for (i in seq_along(state_lengths)) {
+    n_segment_events <- state_lengths[i]
+    current_state <- state_values[i]
+    current_effects <- if (current_state == 1) effects1 else effects2
+
+    sim <- remulateTie(
+      effects = current_effects,
+      actors = actors,
+      events = n_segment_events,
+      endTime = 100000,
+      initial = initialREH
+    )
+
+    all_events <- rbind(all_events, sim)
+    initialREH <- all_events
+  }
+
+  # Prepare event data frame
+  events_df <- as.data.frame(all_events)
+  events_df$sender <- as.character(events_df$sender)
+  events_df$receiver <- as.character(events_df$receiver)
+  events_df$state12 <- hidden_states[seq_len(nrow(events_df))]
+
+  # Compute time differences
+  time_differences <- diff(events_df[[1]])
+  adjusted_differences <- time_differences
+  last_nonzero_diff <- NA
+
+  for (i in 1:length(time_differences)) {
+    if (time_differences[i] == 0) {
+      adjusted_differences[i] <- last_nonzero_diff
+    } else {
+      last_nonzero_diff <- time_differences[i]
+    }
+  }
+
+  adjusted_differences[is.na(adjusted_differences)] <- 0
+  adjusted_differences0 <- c(0, adjusted_differences)
+  events_df$Timedifferencees <- adjusted_differences0
+
+  # Fitting HMM
+  events_df$Timedifferencees[1] <- events_df$time[1]
+  dt <- events_df$Timedifferencees
+
+  HMMdf <- data.frame(
+    ID = rep("a", length(dt)),
+    step = dt,
+    angle = NA
+  )
+
+  hmm_data <- prepData(data = HMMdf, coordNames = NULL)
+
+  # Initial step parameters for 2-state HMM (chosen empirically)
+  dist <- list(step = "exp")
+  Par0 <- list(step = c(0.2, 0.5))
+
+  HMMfit <- fitHMM(
+    data = hmm_data,
+    nbStates = m,
+    dist = dist,
+    Par0 = Par0,
+    formula = ~1
+  )
+
+  HMMfit$mle$step
+  state_sequence <- momentuHMM::viterbi(HMMfit)
+  events_df$Predicted <- state_sequence
+
+  HMM_TR <- append(HMM_TR, list(HMMfit$mle$gamma))
+
+  means_by_group <- aggregate(Timedifferencees ~ Predicted, data = events_df, FUN = mean)
+  sorted_index <- order(means_by_group$Timedifferencees, decreasing = TRUE)
+
+  events_df <- events_df %>%
+    mutate(row_index = row_number(),
+           segment_id = cumsum(c(TRUE, diff(Predicted) != 0)))
+
+  rects <- events_df %>%
+    group_by(segment_id, Predicted) %>%
+    summarize(start = min(row_index), end = max(row_index) + 1, .groups = 'drop') %>%
+    mutate(Color = case_when(
+      Predicted == as.numeric(sorted_index[1]) ~ "Low",
+      Predicted == as.numeric(sorted_index[2]) ~ "High"
+    ))
+
+  events_df$column1 <- ifelse(events_df$Predicted == sorted_index[2], 1, 0)
+
+  correct_preds <- sum(hidden_states == (events_df$column1 + 1))
+  accuracy_percent <- correct_preds / length(hidden_states) * 100
+  accuracies <- c(accuracies, accuracy_percent)
+
+  PTimeState <- ggplot() +
+    geom_rect(data = rects, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf, fill = Color), alpha = 1) +
+    scale_fill_manual(values = c("Low" = "#5DADE2", "High" = "#FFC0CB"), limits = c("Low", "High")) +
+    geom_line(data = events_df, aes(x = row_index, y = Timedifferencees), size = 0.5) +
+    labs(x = "Row Index", y = "Event Frequency (Δt)") +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      panel.border = element_rect(colour = "#00000080", fill = NA, size = 1.5),
+      text = element_text(size = 16),
+      axis.title = element_text(size = 18),
+      axis.text = element_text(size = 14),
+      legend.text = element_text(size = 14),
+      legend.title = element_blank()
+    )
+
+  PTimeState
+
+  # Simple REM
+  stats <- ~ 1 + difference("sex", scaling = "std") +
+    difference("age", scaling = "std") +
+    outdegreeReceiver(scaling = "std") +
+    inertia(scaling = "std")
+
+  reh_tie <- remify::remify(edgelist = events_df, model = "tie", actors = attr_actors$name, directed = TRUE, origin = 0)
+  out <- remstats(reh = reh_tie, tie_effects = stats, attr_actors = attr_actors)
+  fit <- remstimate::remstimate(reh = reh_tie, stats = out, method = "MLE")
+  fit_summary1 <- summary(fit)
+  all_tables_simple <- append(all_tables_simple, list(fit_summary1$coefsTab[, 1]))
+  BICs_simple <- c(BICs_simple, fit_summary1$BIC)
+
+  # REM with State effect
+  stats <- ~ 1 + difference("sex", scaling = "std") +
+    difference("age", scaling = "std") +
+    outdegreeReceiver(scaling = "std") +
+    inertia(scaling = "std") +
+    (event(x = events_df$column1, "PredictedState1"))
+
+  out <- remstats(reh = reh_tie, tie_effects = stats, attr_actors = attr_actors)
+  fit <- remstimate::remstimate(reh = reh_tie, stats = out, method = "MLE")
+  fit_summary2 <- summary(fit)
+  all_tables_State <- append(all_tables_State, list(fit_summary2$coefsTab[, 1]))
+  BICs_State <- c(BICs_State, fit_summary2$BIC)
+  SAVE_FIT_State <- c(SAVE_FIT_State, fit_summary2)
+
+  # REM with Interaction effect
+  stats <- ~ 1 + difference("sex", scaling = "std") +
+    difference("age", scaling = "std") +
+    (outdegreeReceiver(scaling = "std") +
+     inertia(scaling = "std")) :
+    (event(x = events_df$column1, "PredictedState1"))
+
+  out <- remstats(reh = reh_tie, tie_effects = stats, attr_actors = attr_actors)
+  fit <- remstimate::remstimate(reh = reh_tie, stats = out, method = "MLE")
+  fit_summary3 <- summary(fit)
+  all_tables_Interaction <- append(all_tables_Interaction, list(fit_summary3$coefsTab[, 1]))
+  BICs_Interaction <- c(BICs_Interaction, fit_summary3$BIC)
+  SAVE_FIT_Interaction <- c(SAVE_FIT_Interaction, fit_summary3)
+}
+
+```
+
+
+
+```{r summary_statistics}
+mean_values1 <- sapply(1:length(all_tables_simple[[1]]), function(i) mean(sapply(all_tables_simple, function(x) x[i])))
+mean_values1
+sd_values1 <- sapply(1:length(all_tables_simple[[1]]), function(i) sd(sapply(all_tables_simple, function(x) x[i])))
+sd_values1
+mean_BIC1 <- mean(BICs_simple)
+mean_BIC1
+sd_BIC1 <- sd(BICs_simple)
+sd_BIC1
+
+mean_values2 <- sapply(1:length(all_tables_State[[1]]), function(i) mean(sapply(all_tables_State, function(x) x[i])))
+mean_values2
+sd_values2 <- sapply(1:length(all_tables_State[[1]]), function(i) sd(sapply(all_tables_State, function(x) x[i])))
+sd_values2
+mean_BIC2 <- mean(BICs_State)
+mean_BIC2
+sd_BIC2 <- sd(BICs_State)
+sd_BIC2
+
+mean_values3 <- sapply(1:length(all_tables_Interaction[[1]]), function(i) mean(sapply(all_tables_Interaction, function(x) x[i])))
+mean_values3
+sd_values3 <- sapply(1:length(all_tables_Interaction[[1]]), function(i) sd(sapply(all_tables_Interaction, function(x) x[i])))
+sd_values3
+mean_BIC3 <- mean(BICs_Interaction)
+mean_BIC3
+sd_BIC3 <- sd(BICs_Interaction)
+sd_BIC3
+
+mean_HMM <- sapply(1:length(HMM_TR[[1]]), function(i) mean(sapply(HMM_TR, function(x) x[i])))
+mean_HMM
+sd_HMM <- sapply(1:length(HMM_TR[[1]]), function(i) sd(sapply(HMM_TR, function(x) x[i])))
+sd_HMM
+mean_accuracy <- mean(accuracies)
+sd(accuracies)
+
+```
+
+
+
+
+

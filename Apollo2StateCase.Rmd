@@ -1,0 +1,345 @@
+```{r setup_packages}
+# Load necessary libraries
+library(remify)
+library(remstats)
+library(remstimate)
+library(dplyr)
+library(readr)
+library(zoo)
+library(ggplot2)
+library(plotly)
+library(readxl)
+library(fastDummies)
+library(abind)
+library(momentuHMM)
+```
+
+
+
+
+```{r load_apollo_data}
+# Load Apollo13 dataset
+load("Apollo13_completeData.RData")
+time_sender_receiver <- Merged_ALL_parts_Apollo
+
+print(time_sender_receiver)
+
+```
+
+```{r compute_adjusted_differences}
+# Compute adjusted differences between event times
+time_differences <- diff(time_sender_receiver$time)
+time_sender_receiver$adjusted_differences <- c(0, time_differences)
+
+time_sender_receiver <- time_sender_receiver %>%
+  group_by(time) %>%
+  mutate(adjusted_differences = first(adjusted_differences)) %>%
+  ungroup()
+
+```
+
+
+
+```{r fit_HMM}
+# Prepare edgelist
+edgelist <- time_sender_receiver
+edgelist$message <- NULL
+nstates <- 2
+
+edgelist <- na.omit(edgelist)
+edgelist$adjusted_differences[1] <- 1
+
+# Prepare data for HMM
+dt <- edgelist$adjusted_differences
+HMMdf <- data.frame(
+  ID = rep("a", length(dt)),
+  step = dt,
+  angle = NA
+)
+
+hmm_data <- prepData(data = HMMdf, coordNames = NULL)
+
+# Fit HMM
+dist <- list(step = "exp")
+Par0 <- list(step = c(0.1, 0.5))
+
+fit <- fitHMM(
+  data = hmm_data,
+  nbStates = nstates,
+  dist = dist,
+  Par0 = Par0,
+  formula = ~1
+)
+
+# Print HMM results
+print(fit)
+fit$mle$step
+
+# Add predicted states to edgelist
+state_sequence <- momentuHMM::viterbi(fit)
+edgelist$Predicted <- state_sequence
+state_counts <- table(edgelist$Predicted)
+print(state_counts)
+
+# Prepare segmentation
+edgelist$row_index <- seq_len(nrow(edgelist))
+means_by_group <- aggregate(adjusted_differences ~ Predicted, data = edgelist, FUN = mean)
+sorted_index <- order(means_by_group$adjusted_differences, decreasing = TRUE)
+
+edgelist <- edgelist %>%
+  mutate(row_index = row_number(),
+         segment_id = cumsum(c(TRUE, diff(Predicted) != 0)))
+
+rects <- edgelist %>%
+  group_by(segment_id, Predicted) %>%
+  summarize(start = min(row_index), end = max(row_index) + 1, .groups = 'drop') %>%
+  mutate(Color = case_when(
+    Predicted == as.numeric(sorted_index[1]) ~ "Low",
+    Predicted == as.numeric(sorted_index[2]) ~ "High"
+  ))
+
+edgelist$column0 <- ifelse(edgelist$Predicted == sorted_index[2], 1, 0)
+
+# Plot HMM segmentation
+PTimeState <- ggplot() + 
+  geom_rect(data = rects[1:22, ], aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf, fill = Color), alpha = 1) + 
+  scale_fill_manual(values = c("Low" = "#5DADE2", "High" = "#FFC0CB"), limits = c("Low", "High")) +
+  geom_line(data = edgelist[1:1000, ], aes(x = row_index, y = adjusted_differences), size = 0.5) +  
+  geom_vline(xintercept = 249, color = "black", linetype = "dashed", size = 1) + 
+  labs(x = "Row Index", y = "Event Frequency (Δt)") + 
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.border = element_rect(colour = "#00000080", fill = NA, size = 1.5),
+    text = element_text(size = 16),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_blank()
+  )
+
+PTimeState
+
+```
+
+```{r prepare_covariates}
+# Prepare actor attributes and dyadic covariates
+names(edgelist)[2:3] <- c("actor1", "actor2")
+actors <- sort(unique(c(edgelist$actor1, edgelist$actor2)))
+
+info <- data.frame(
+  id = actors,
+  time = 0,
+  team = ifelse(actors %in% c("CDR", "LMP", "CMP"), "air", "ground")
+)
+
+info <- dummy_cols(info, select_columns = "id")
+info <- dummy_cols(info, select_columns = "team")
+
+getTie <- function(var1, var2, actors) {
+  x <- var1 %*% t(var2)
+  rownames(x) <- colnames(x) <- actors
+  x
+}
+
+air_to_air <- getTie(info$team_air, info$team_air, info$id)
+ground_to_CAPCOM <- getTie(info$team_ground, info$id_CAPCOM, info$id)
+air_to_CAPCOM <- getTie(info$team_air, info$id_CAPCOM, info$id)
+CAPCOM_to_air <- getTie(info$id_CAPCOM, info$team_air, info$id)
+ground_to_FLIGHT <- getTie(info$team_ground, info$id_FLIGHT, info$id)
+FLIGHT_to_ground <- getTie(info$id_FLIGHT, info$team_ground, info$id)
+
+# Define REM formula
+stats <- ~ 1 + 
+  rrankSend() + 
+  psABBA() + psABBY() + psABXA() + psABAY() +
+  reciprocity(scaling = "prop") +
+  outdegreeSender(scaling = "prop") +
+  tie(variable = "air_to_air", attr_dyads = air_to_air) +
+  tie(variable = "ground_to_CAPCOM", attr_dyads = ground_to_CAPCOM) +
+  tie(variable = "ground_to_FLIGHT", attr_dyads = ground_to_FLIGHT) +
+  tie(variable = "FLIGHT_to_ground", attr_dyads = FLIGHT_to_ground) +
+  tie(variable = "air_to_CAPCOM", attr_dyads = air_to_CAPCOM) +
+  (tie(variable = "CAPCOM_to_air", attr_dyads = CAPCOM_to_air)) :
+  (rrankReceive())
+```
+
+
+```{r fit_REM}
+# Split training and test sets
+edgelist2 <- edgelist
+N_train <- 4998
+N_test <- 500
+
+edgelist_train <- edgelist2[1:N_train, ]
+edgelist_test  <- edgelist2[(N_train + 1):(N_train + N_test), ]
+
+# Create remify object for training data
+reh_train <- remify::remify(
+  edgelist = edgelist_train,
+  riskset = "active",
+  model = "tie",
+  directed = TRUE,
+  origin = 0
+)
+
+# Compute statistics for training data
+out_train <- remstats(
+  reh = reh_train,
+  tie_effects = stats,
+  attr_actors = attributes
+)
+
+# Fit REM on training data
+fit_train <- remstimate::remstimate(
+  reh = reh_train,
+  stats = out_train,
+  method = "MLE"
+)
+
+
+```
+
+
+```{r performance_REM}
+# Evaluate predictive performance
+coeff_train <- summary(fit_train)$coefsTab[, 1]
+
+# Create remify object for full data
+edgelist_full <- rbind(edgelist_train, edgelist_test)
+reh_full <- remify::remify(
+  edgelist = edgelist_full,
+  riskset = "active",
+  model = "tie",
+  directed = TRUE,
+  origin = 0
+)
+
+# Compute statistics for full data
+out_full <- remstats(
+  reh = reh_full,
+  tie_effects = stats,
+  attr_actors = attributes
+)
+
+# Fit REM on full data
+fits <- remstimate::remstimate(
+  reh = reh_full,
+  stats = out_full,
+  method = "MLE"
+)
+
+fit_summary <- summary(fits)
+
+# Predictive performance
+out_perf <- get_outofsample_perf_MLE(
+  coeff   = coeff_train,
+  stats   = out_full,
+  reh     = reh_full,
+  M_train = N_train,
+  M_test  = N_test
+)
+
+coeff <- fits$coefficients
+in_perf <- get_insample_perf_MLE(coeff, out_full, reh_full)
+
+
+```
+
+
+```{r HMMREM_model}
+# Define REM with state effects (HMMREM)
+stats2train <- ~ 1 + 
+  rrankSend() + 
+  psABBA() + psABBY() + psABXA() + psABAY() +
+  reciprocity(scaling = "prop") +
+  outdegreeSender(scaling = "prop") +
+  tie(variable = "air_to_air", attr_dyads = air_to_air) +
+  tie(variable = "ground_to_CAPCOM", attr_dyads = ground_to_CAPCOM) +
+  tie(variable = "ground_to_FLIGHT", attr_dyads = ground_to_FLIGHT) +
+  tie(variable = "FLIGHT_to_ground", attr_dyads = FLIGHT_to_ground) +
+  tie(variable = "air_to_CAPCOM", attr_dyads = air_to_CAPCOM) +
+  (tie(variable = "CAPCOM_to_air", attr_dyads = CAPCOM_to_air)) :
+  (rrankReceive() + event(x = edgelist_train$column0, "PredictedState1")) +
+  rrankReceive() : event(x = edgelist_train$column0, "PredictedState1")
+
+stats2full <- ~ 1 + 
+  rrankSend() + 
+  psABBA() + psABBY() + psABXA() + psABAY() +
+  reciprocity(scaling = "prop") +
+  outdegreeSender(scaling = "prop") +
+  tie(variable = "air_to_air", attr_dyads = air_to_air) +
+  tie(variable = "ground_to_CAPCOM", attr_dyads = ground_to_CAPCOM) +
+  tie(variable = "ground_to_FLIGHT", attr_dyads = ground_to_FLIGHT) +
+  tie(variable = "FLIGHT_to_ground", attr_dyads = FLIGHT_to_ground) +
+  tie(variable = "air_to_CAPCOM", attr_dyads = air_to_CAPCOM) +
+  (tie(variable = "CAPCOM_to_air", attr_dyads = CAPCOM_to_air)) :
+  (rrankReceive() + event(x = edgelist_full$column0, "PredictedState1")) +
+  rrankReceive() : event(x = edgelist_full$column0, "PredictedState1")
+
+
+```
+
+```{r performance_HMMREM}
+# Fit HMMREM on training data
+reh_train <- remify::remify(
+  edgelist = edgelist_train,
+  riskset = "active",
+  model = "tie",
+  directed = TRUE,
+  origin = 0
+)
+
+out_train2 <- remstats(
+  reh = reh_train,
+  tie_effects = stats2train,
+  attr_actors = attributes
+)
+
+fit_train2 <- remstimate::remstimate(
+  reh = reh_train,
+  stats = out_train2,
+  method = "MLE"
+)
+
+# Predictive performance for HMMREM
+coeff_train2 <- summary(fit_train2)$coefsTab[, 1]
+
+reh_full <- remify::remify(
+  edgelist = edgelist_full,
+  riskset = "active",
+  model = "tie",
+  directed = TRUE,
+  origin = 0
+)
+
+out_full2 <- remstats(
+  reh = reh_full,
+  tie_effects = stats2full,
+  attr_actors = attributes
+)
+
+fits2 <- remstimate::remstimate(
+  reh = reh_full,
+  stats = out_full2,
+  method = "MLE"
+)
+
+fit2_summary <- summary(fits2)
+
+# Predictive performance for HMMREM
+out_perf2 <- get_outofsample_perf_MLE(
+  coeff   = coeff_train2,
+  stats   = out_full2,
+  reh     = reh_full,
+  M_train = N_train,
+  M_test  = N_test
+)
+
+coeff2 <- fits2$coefficients
+in_perf <- get_insample_perf_MLE(coeff2, out_full2, reh_full)
+
+
+```
+
+

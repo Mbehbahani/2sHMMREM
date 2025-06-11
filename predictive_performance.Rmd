@@ -1,0 +1,143 @@
+```{r setup_packages}
+# Load required packages
+library(readxl)
+library(fastDummies)
+library(abind)
+library(remify)
+
+```
+
+
+
+```{r insample_prediction}
+# In-sample prediction for REM (MLE version)
+# -------------------------------------------------
+# Computes in-sample predictive performance for a tie-oriented REM estimated via MLE.
+#
+# Inputs:
+# - coeff  : numeric vector of estimated coefficients
+# - stats  : 3d array (N_events × N_dyads × P) from remstats()
+# - reh    : remify object (used to extract edgelist sender/receiver)
+#
+# Output:
+# - mean_rank: Mean rank of actual events
+# - rank_vector: Vector of event ranks
+# - hit_rates: Hit rates (strict, 10%, 20%, 30%)
+
+get_insample_perf_MLE <- function(coeff, stats, reh) {
+  M <- dim(stats)[1]
+  D <- dim(stats)[2]
+  beta_hat <- coeff
+  
+  # Build dyad mapping
+  dyads <- getDyad(reh, dyadID = seq_len(D), active = TRUE)
+  senders   <- reh$edgelist[, 2]
+  receivers <- reh$edgelist[, 3]
+  
+  event_idx <- mapply(function(s, r) {
+    which(dyads$actor1 == s & dyads$actor2 == r)
+  }, senders, receivers)
+  
+  # Initialize storage
+  ranks       <- integer(M)
+  strict_hit  <- integer(M)
+  top10_hit   <- integer(M)
+  top20_hit   <- integer(M)
+  top30_hit   <- integer(M)
+  
+  for (i in seq_len(M)) {
+    Z <- stats[i, , ] %*% beta_hat
+    ord <- order(Z, decreasing = TRUE)
+    actual <- event_idx[i]
+    
+    ranks[i]       <- which(ord == actual)
+    strict_hit[i]  <- as.integer(ord[1] == actual)
+    top10_hit[i]   <- as.integer(actual %in% ord[seq_len(floor(0.1 * D))])
+    top20_hit[i]   <- as.integer(actual %in% ord[seq_len(floor(0.2 * D))])
+    top30_hit[i]   <- as.integer(actual %in% ord[seq_len(floor(0.3 * D))])
+  }
+  
+  scores <- c(
+    strict = mean(strict_hit),
+    ten    = mean(top10_hit),
+    twenty = mean(top20_hit),
+    thirty = mean(top30_hit)
+  )
+  
+  list(
+    mean_rank   = mean(ranks),
+    rank_vector = ranks,
+    hit_rates   = scores
+  )
+}
+
+```
+
+```{r outofsample_prediction}
+# Out-of-sample prediction for REM (MLE version)
+# -------------------------------------------------
+# Computes out-of-sample predictive performance for a tie-oriented REM estimated via MLE.
+#
+# Inputs:
+# - coeff    : numeric vector of estimated coefficients
+# - stats    : 3d array (N_events × N_dyads × P) from remstats()
+# - reh      : remify object (used to extract edgelist sender/receiver)
+# - M_train  : number of training events
+# - M_test   : number of test events
+#
+# Output:
+# - mean_rank: Mean rank of actual test events
+# - rank_vector: Vector of test event ranks
+# - hit_rates: Hit rates (strict, 10%, 20%, 30%)
+
+get_outofsample_perf_MLE <- function(coeff, stats, reh, M_train, M_test) {
+  D <- dim(stats)[2]
+  beta_hat <- coeff
+  
+  # Build dyad mapping
+  dyads <- getDyad(reh, dyadID = seq_len(D), active = TRUE)
+  senders   <- reh$edgelist[, 2]
+  receivers <- reh$edgelist[, 3]
+  
+  event_idx <- mapply(function(s, r) {
+    which(dyads$actor1 == s & dyads$actor2 == r)
+  }, senders, receivers)
+  
+  # Initialize storage
+  ranks       <- integer(M_test)
+  strict_hit  <- integer(M_test)
+  top10_hit   <- integer(M_test)
+  top20_hit   <- integer(M_test)
+  top30_hit   <- integer(M_test)
+  
+  for (j in seq_len(M_test)) {
+    i <- M_train + j
+    Z <- stats[i, , ] %*% beta_hat
+    ord <- order(Z, decreasing = TRUE)
+    actual <- event_idx[i]
+    
+    ranks[j]       <- which(ord == actual)
+    strict_hit[j]  <- as.integer(ord[1] == actual)
+    top10_hit[j]   <- as.integer(actual %in% ord[seq_len(floor(0.1 * D))])
+    top20_hit[j]   <- as.integer(actual %in% ord[seq_len(floor(0.2 * D))])
+    top30_hit[j]   <- as.integer(actual %in% ord[seq_len(floor(0.3 * D))])
+  }
+  
+  hit_rates <- c(
+    strict = mean(strict_hit),
+    ten    = mean(top10_hit),
+    twenty = mean(top20_hit),
+    thirty = mean(top30_hit)
+  )
+  
+  list(
+    mean_rank   = mean(ranks),
+    rank_vector = ranks,
+    hit_rates   = hit_rates
+  )
+}
+
+```
+
+
+
