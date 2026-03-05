@@ -72,7 +72,7 @@ scenarios <- list(
     inertia1 = base_emissions$inertia1,
     inertia2 = base_emissions$inertia2,
     sep_factor = 1.0,
-    T_values = c(3000,600)
+    T_values = c(500,3000)
   ),
   Medium = list(
     name = "Medium",
@@ -85,7 +85,7 @@ scenarios <- list(
     inertia1 = base_emissions$inertia1,
     inertia2 = base_emissions$inertia2,
     sep_factor = 1.0,
-    T_values = c(300)
+    T_values = c(500)
   ),
   Hard = list(
     name = "Hard",
@@ -98,7 +98,7 @@ scenarios <- list(
     inertia1 = hard_emissions$inertia1,
     inertia2 = hard_emissions$inertia2,
     sep_factor = sep_factor_hard,
-    T_values = c(300)
+    T_values = c(500)
   ),
   ExtremeHard = list(
     name = "ExtremeHard",
@@ -111,7 +111,7 @@ scenarios <- list(
     inertia1 = hard_emissions$inertia1,
     inertia2 = hard_emissions$inertia2,
     sep_factor = sep_factor_hard,
-    T_values = c(300)
+    T_values = c(500,1500)
   )
 )
 
@@ -127,10 +127,10 @@ for (sc_name in names(scenarios)) {
 }
 
 # Number of replications
-R <- 10
+R <- 3
 
 # Number of actors
-n_actors <- c(10)
+n_actors <- c(10,15)
 
 # States to test in HMM fitting
 states_to_fit <- 1:4
@@ -812,6 +812,7 @@ run_one_scenario <- function(config_name, config) {
   
   # Initialize density storage for this configuration
   density_storage <- list()
+  run_full_config <- isTRUE(RUN_HMM_REM) && identical(config$n_actors, 15) && identical(n_events, 3000)
   
   for (iter in 1:R) {
     cat("  Replication", iter, "\n")
@@ -945,8 +946,8 @@ run_one_scenario <- function(config_name, config) {
     
     # Determine which states to fit:
     # ALWAYS fit 2-state (for confidence metrics & accuracy)
-    # Only fit 1, 3, 4 states when RUN_HMM_REM = TRUE
-    states_this_run <- if (RUN_HMM_REM) states_to_fit else c(2)
+    # Only fit 1, 3, 4 states for the designated full config when RUN_HMM_REM = TRUE
+    states_this_run <- if (run_full_config) states_to_fit else c(2)
     
     # Fit HMM with selected number of states
     for (m in states_this_run) {
@@ -1028,13 +1029,14 @@ run_one_scenario <- function(config_name, config) {
           })
         }
         
-        # For 2-state model, fit REM models (only when RUN_HMM_REM = TRUE)
-        if (m == 2 && RUN_HMM_REM) {
+        # For 2-state model, fit REM models only for the designated full config
+        if (m == 2 && run_full_config) {
           events_df$predicted_state <- viterbi_states
           means_by_group <- aggregate(Timedifferencees ~ predicted_state, 
                                       data = events_df, FUN = mean)
           sorted_index <- order(means_by_group$Timedifferencees, decreasing = TRUE)
           events_df$state_indicator <- ifelse(events_df$predicted_state == sorted_index[2], 1, 0)
+          state_indicator <<- events_df$state_indicator
           
           reh_tie <- remify::remify(edgelist = events_df, model = "tie", 
                                     actors = attr_actors$name, directed = TRUE, origin = 0)
@@ -1059,7 +1061,7 @@ run_one_scenario <- function(config_name, config) {
             difference("age", scaling = "std") +
             outdegreeReceiver(scaling = "std") +
             inertia(scaling = "std") +
-            (event(x = events_df$state_indicator, "PredictedState1"))
+            (event(x = state_indicator, "PredictedState1"))
           
           out2 <- remstats(reh = reh_tie, tie_effects = stats2, attr_actors = attr_actors)
           fit2 <- remstimate::remstimate(reh = reh_tie, stats = out2, method = "MLE")
@@ -1074,7 +1076,7 @@ run_one_scenario <- function(config_name, config) {
           stats3 <- ~ 1 + difference("sex", scaling = "std") +
             difference("age", scaling = "std") +
             (outdegreeReceiver(scaling = "std") + inertia(scaling = "std")) :
-            (event(x = events_df$state_indicator, "PredictedState1"))
+            (event(x = state_indicator, "PredictedState1"))
           
           out3 <- remstats(reh = reh_tie, tie_effects = stats3, attr_actors = attr_actors)
           fit3 <- remstimate::remstimate(reh = reh_tie, stats = out3, method = "MLE")
@@ -1133,8 +1135,13 @@ run_one_scenario <- function(config_name, config) {
       rho_hat_mean = NaN, rho_hat_sd = NA
     )
     all_results[[config_name]] <- list(scenario = config_name, replications = list())
-    # all_hmm_agg[[config_name]] left NULL intentionally (no data)
-    next  # move to next config
+    return(list(
+      all_results = all_results,
+      all_hmm_agg = all_hmm_agg,
+      all_diagnostics = all_diagnostics,
+      all_rem_agg = all_rem_agg,
+      log = log_lines
+    ))
   }
 
   # Compute diagnostics
@@ -1154,7 +1161,7 @@ run_one_scenario <- function(config_name, config) {
     all_results[[config_name]] <- list(scenario = config_name, replications = replications)
     # Always aggregate HMM results (2-state is always fitted)
     all_hmm_agg[[config_name]] <- aggregate_hmm_results(config_name, replications)
-  if (RUN_HMM_REM) {
+  if (run_full_config) {
     all_rem_agg[[config_name]] <- aggregate_rem_results(replications)
   }
 
@@ -1182,7 +1189,7 @@ cat("  Logical cores available:", parallel::detectCores(), "\n")
 cat(strrep("=", 70), "\n")
 
 # --- D: Cluster setup (PSOCK – works on Windows and Linux) ----------------------
-n_cores <- min(4L, length(run_configs))
+n_cores <- min(parallel::detectCores(), length(run_configs))
 cl <- parallel::makeCluster(n_cores, type = "PSOCK")
 results_list <- tryCatch({
 
@@ -1253,6 +1260,12 @@ all_hmm_agg    <- all_hmm_agg[names(run_configs)[names(run_configs) %in% names(a
 all_diagnostics <- all_diagnostics[names(run_configs)[names(run_configs) %in% names(all_diagnostics)]]
 if (length(all_rem_agg) > 0)
   all_rem_agg <- all_rem_agg[names(run_configs)[names(run_configs) %in% names(all_rem_agg)]]
+
+full_config_names <- names(run_configs)[vapply(run_configs, function(cfg) {
+  identical(cfg$n_actors, 15) && identical(cfg$n_events, 3000)
+}, logical(1))]
+full_hmm_agg <- all_hmm_agg[full_config_names[full_config_names %in% names(all_hmm_agg)]]
+full_rem_agg <- all_rem_agg[full_config_names[full_config_names %in% names(all_rem_agg)]]
 
 # --- Validation: confirm merge produced actual data -----------------------------
 cat("\nMerge summary:\n")
@@ -1340,7 +1353,11 @@ cat("\n\n", strrep("=", 70), "\n")
 cat("  AGGREGATED RESULTS\n")
 cat(strrep("=", 70), "\n")
 
-combined_hmm <- do.call(rbind, all_hmm_agg)
+if (length(full_hmm_agg) == 0) {
+  cat("No eligible full-analysis configs found for N = 15 and T = 3000.\n")
+  cat("Skipping Model_Selection, REM summaries, and full-mode figures.\n")
+} else {
+combined_hmm <- do.call(rbind, full_hmm_agg)
 
 cat("\n--- HMM Model Selection Summary ---\n\n")
 print(knitr::kable(combined_hmm[, c("Scenario", "States", "BIC_mean", "BIC_sd", 
@@ -1353,12 +1370,12 @@ print(knitr::kable(combined_hmm[, c("Scenario", "States", "BIC_mean", "BIC_sd",
 
 cat("\n\n--- REM Coefficient Estimates (2-State Model) ---\n")
 
-for (scenario_name in names(all_rem_agg)) {
+for (scenario_name in names(full_rem_agg)) {
   cat("\n", strrep("-", 50), "\n")
   cat("Scenario:", scenario_name, "\n")
   cat(strrep("-", 50), "\n")
   
-  rem_results <- all_rem_agg[[scenario_name]]
+  rem_results <- full_rem_agg[[scenario_name]]
   
   if (!is.null(rem_results)) {
     for (model_name in names(rem_results)) {
@@ -1377,17 +1394,17 @@ for (scenario_name in names(all_rem_agg)) {
 
 cat("\n\n--- Generating Figures ---\n")
 
-p_bic <- create_bic_comparison_plot(all_hmm_agg, R)
+p_bic <- create_bic_comparison_plot(full_hmm_agg, R)
 print(p_bic)
 ggsave("HMMREM_scenario_comparison.png", p_bic, width = 10, height = 6, dpi = 300, bg = "white")
 cat("Saved: HMMREM_scenario_comparison.png\n")
 
-p_conf <- create_confidence_plot(all_hmm_agg, tau1, tau2)
+p_conf <- create_confidence_plot(full_hmm_agg, tau1, tau2)
 print(p_conf)
 ggsave("HMMREM_confidence_comparison.png", p_conf, width = 8, height = 6, dpi = 300, bg = "white")
 cat("Saved: HMMREM_confidence_comparison.png\n")
 
-p_ovl <- tryCatch(create_overlap_plot(all_hmm_agg), error = function(e) NULL)
+p_ovl <- tryCatch(create_overlap_plot(full_hmm_agg), error = function(e) NULL)
 if (!is.null(p_ovl)) {
   print(p_ovl)
   ggsave("HMMREM_overlap_comparison.png", p_ovl, width = 10, height = 6, dpi = 300, bg = "white")
@@ -1433,10 +1450,11 @@ print(knitr::kable(summary_table, align = "lcccc",
                                  paste0("Unc (tau=", tau2, ")"), "Accuracy")))
 
 cat("\n\nOptimal Number of States (by BIC):\n")
-for (scenario_name in names(all_hmm_agg)) {
-  best_row <- all_hmm_agg[[scenario_name]][which.min(all_hmm_agg[[scenario_name]]$BIC_mean), ]
+for (scenario_name in names(full_hmm_agg)) {
+  best_row <- full_hmm_agg[[scenario_name]][which.min(full_hmm_agg[[scenario_name]]$BIC_mean), ]
   cat("  ", scenario_name, ": ", best_row$States, " state(s) (BIC = ", 
       round(best_row$BIC_mean, 1), ")\n", sep = "")
+}
 }
 
 # Print diagnostics summary
