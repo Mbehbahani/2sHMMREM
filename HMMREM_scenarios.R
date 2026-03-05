@@ -72,7 +72,7 @@ scenarios <- list(
     inertia1 = base_emissions$inertia1,
     inertia2 = base_emissions$inertia2,
     sep_factor = 1.0,
-    T_values = c(3000,6000)
+    T_values = c(3000,300)
   ),
   Medium = list(
     name = "Medium",
@@ -85,7 +85,7 @@ scenarios <- list(
     inertia1 = base_emissions$inertia1,
     inertia2 = base_emissions$inertia2,
     sep_factor = 1.0,
-    T_values = c(3000,6000)
+    T_values = c(300)
   ),
   Hard = list(
     name = "Hard",
@@ -98,7 +98,7 @@ scenarios <- list(
     inertia1 = hard_emissions$inertia1,
     inertia2 = hard_emissions$inertia2,
     sep_factor = sep_factor_hard,
-    T_values = c(3000,6000)
+    T_values = c(300)
   ),
   ExtremeHard = list(
     name = "ExtremeHard",
@@ -111,7 +111,7 @@ scenarios <- list(
     inertia1 = hard_emissions$inertia1,
     inertia2 = hard_emissions$inertia2,
     sep_factor = sep_factor_hard,
-    T_values = c(3000,6000)
+    T_values = c(300)
   )
 )
 
@@ -127,10 +127,10 @@ for (sc_name in names(scenarios)) {
 }
 
 # Number of replications
-R <- 10
+R <- 20
 
 # Number of actors
-n_actors <- c(10,15,20)
+n_actors <- c(10)
 
 # States to test in HMM fitting
 states_to_fit <- 1:4
@@ -436,6 +436,90 @@ compute_state_overlap <- function(dt, viterbi_states, hmm_fit) {
 # 4. Aggregation Functions
 # -----------------------------------------------------------------------------
 
+# Create clean density plot for aggregated data
+create_density_plot <- function(density_data) {
+  # Input validation
+  stopifnot("Data frame must contain 'x' column" = "x" %in% colnames(density_data))
+  stopifnot("Data frame must contain 'y' column" = "y" %in% colnames(density_data))
+  stopifnot("Data frame must contain 'State' column" = "State" %in% colnames(density_data))
+  stopifnot("Data frame cannot be empty" = nrow(density_data) > 0)
+  stopifnot("'x' must be numeric" = is.numeric(density_data$x))
+  stopifnot("'y' must be numeric" = is.numeric(density_data$y))
+
+  if (!"replication" %in% colnames(density_data)) {
+    warning("Missing 'replication' column; falling back to raw density lines.")
+    return(
+      ggplot(density_data, aes(x = x, y = y, color = State)) +
+        geom_line(linewidth = 1) +
+        labs(x = "Inter-event time", y = "Density") +
+        theme_minimal() +
+        theme(legend.position = "bottom")
+    )
+  }
+
+  common_x <- seq(0, max(density_data$x, na.rm = TRUE), length.out = 512)
+  density_groups <- split(
+    density_data,
+    list(density_data$State, density_data$replication),
+    drop = TRUE
+  )
+
+  interpolated_density <- lapply(density_groups, function(df) {
+    df <- df[order(df$x), c("x", "y", "State", "replication")]
+    df <- df[!duplicated(df$x), ]
+    interpolated_y <- stats::approx(
+      x = df$x,
+      y = df$y,
+      xout = common_x,
+      yleft = 0,
+      yright = 0,
+      rule = 1,
+      ties = mean
+    )$y
+
+    data.frame(
+      x = common_x,
+      y = interpolated_y,
+      State = df$State[1],
+      replication = df$replication[1]
+    )
+  })
+
+  summary_density <- dplyr::bind_rows(interpolated_density) |>
+    dplyr::group_by(State, x) |>
+    dplyr::summarise(
+      density_mean = mean(y, na.rm = TRUE),
+      density_min = min(y, na.rm = TRUE),
+      density_max = max(y, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  ggplot(summary_density, aes(x = x, color = State, fill = State)) +
+    geom_ribbon(
+      aes(ymin = density_min, ymax = density_max),
+      alpha = 0.35,
+      color = NA,
+      show.legend = FALSE
+    ) +
+    geom_line(aes(y = density_mean), linewidth = 0.7) + 
+    labs(
+      x = "Inter-event time",
+      y = "Density"
+    ) +
+    scale_x_continuous(limits = c(0, 60), expand = c(0, 0)) +
+    coord_cartesian(xlim = c(0, 60)) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      panel.border = element_rect(colour = "#00000080", fill = NA, linewidth = 1.5),
+      text = element_text(size = 16),
+      axis.title = element_text(size = 18),
+      axis.text = element_text(size = 14),
+      legend.text = element_text(size = 14),
+      legend.title = element_blank()
+    )
+}
+
 aggregate_hmm_results <- function(scenario_name, replications) {
   # Remove any NULL entries (skipped iterations)
   replications <- Filter(Negate(is.null), replications)
@@ -736,6 +820,9 @@ run_one_scenario <- function(sc_key, configs_for_scenario) {
   
   replications <- list()
   
+  # Initialize density storage for this configuration
+  density_storage <- list()
+  
   for (iter in 1:R) {
     cat("  Replication", iter, "\n")
     
@@ -922,36 +1009,32 @@ run_one_scenario <- function(sc_key, configs_for_scenario) {
               " OVL_kde=", round(overlap$overlap_OVL_kde, 3),
               " W1=", round(overlap$overlap_W1, 4), "\n")
           
-          # Save density overlap plot per replication
+          # Collect density data for aggregation
           tryCatch({
             unique_st <- sort(unique(viterbi_states))
-            dt1_plot <- dt[viterbi_states == unique_st[1]]
-            dt2_plot <- dt[viterbi_states == unique_st[2]]
-            upper_plot <- quantile(dt, 0.999)
-            d1_plot <- density(dt1_plot, from = 0, to = upper_plot, n = 512)
-            d2_plot <- density(dt2_plot, from = 0, to = upper_plot, n = 512)
-            density_df <- rbind(
-              data.frame(x = d1_plot$x, y = d1_plot$y, State = paste("State", unique_st[1])),
-              data.frame(x = d2_plot$x, y = d2_plot$y, State = paste("State", unique_st[2]))
-            )
-            p_dens <- ggplot(density_df, aes(x = x, y = y, fill = State, color = State)) +
-              geom_line(linewidth = 1) +
-              geom_area(alpha = 0.3, position = "identity") +
-              labs(title = paste("State Density Overlap -", config_name, "(rep", iter, ")"),
-                   subtitle = paste0("OVL_kde=", round(overlap$overlap_OVL_kde, 3),
-                                     "  W1=", round(overlap$overlap_W1, 4)),
-                   x = "Inter-event time (step)", y = "Density") +
-              scale_fill_manual(values = c("#E74C3C", "#3498DB")) +
-              scale_color_manual(values = c("#E74C3C", "#3498DB")) +
-              theme_minimal() +
-              theme(plot.title = element_text(size = 14, face = "bold"),
-                    legend.position = "bottom")
-            output_dir <- file.path("plots", scenario_name)
-            dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
-            ggsave(file.path(output_dir, paste0("overlap_density_", config_name, "_rep", iter, ".png")), p_dens,
-                   width = 8, height = 5, dpi = 200, bg = "white")
+            if (length(unique_st) == 2) {
+              dt1_collect <- dt[viterbi_states == unique_st[1]]
+              dt2_collect <- dt[viterbi_states == unique_st[2]]
+              upper_collect <- quantile(dt, 0.999)
+              
+              d1_collect <- density(dt1_collect, from = 0, to = upper_collect, n = 512)
+              d2_collect <- density(dt2_collect, from = 0, to = upper_collect, n = 512)
+              
+              density_df_rep <- rbind(
+                data.frame(x = d1_collect$x, y = d1_collect$y, 
+                           State = paste("State", unique_st[1]),
+                           replication = iter,
+                           config_name = config_name),
+                data.frame(x = d2_collect$x, y = d2_collect$y, 
+                           State = paste("State", unique_st[2]),
+                           replication = iter,
+                           config_name = config_name)
+              )
+              
+              density_storage[[length(density_storage) + 1]] <- density_df_rep
+            }
           }, error = function(e) {
-            message("    Could not save density plot: ", e$message)
+            message("    Could not collect density data: ", e$message)
           })
         }
         
@@ -1022,6 +1105,32 @@ run_one_scenario <- function(sc_key, configs_for_scenario) {
     }
     
     replications[[length(replications) + 1]] <- rep_results
+  }
+  
+  # --- Aggregate and save density data -----------------------------------------
+  if (length(density_storage) > 0) {
+    tryCatch({
+      combined_density <- dplyr::bind_rows(density_storage)
+      
+      density_data_dir <- "density_data"
+      dir.create(density_data_dir, showWarnings = FALSE, recursive = TRUE)
+      
+      density_rds_path <- file.path(density_data_dir, paste0("density_data_", config_name, ".rds"))
+      saveRDS(combined_density, density_rds_path)
+      cat("  Saved density data:", density_rds_path, "\n")
+      
+      density_plot_dir <- file.path("plots", "density")
+      dir.create(density_plot_dir, showWarnings = FALSE, recursive = TRUE)
+      
+      p_density <- create_density_plot(combined_density)
+      density_svg_path <- file.path(density_plot_dir, paste0("density_", config_name, ".svg"))
+      ggsave(density_svg_path, p_density, device = "svg", 
+             width = 8, height = 5, bg = "white")
+      cat("  Saved density plot:", density_svg_path, "\n")
+      
+    }, error = function(e) {
+      message("  Could not aggregate/save density data: ", e$message)
+    })
   }
   
   # --- Guard against empty replications (all iterations skipped) ---------------
@@ -1107,6 +1216,7 @@ parallel::clusterExport(cl, varlist = c(
   "trapez_integrate", "compute_OVL_hist", "compute_OVL_kde", "compute_W1",
   "infer_step_param_type", "compute_parametric_overlap", "compute_state_overlap",
   "aggregate_hmm_results", "aggregate_rem_results",
+  "create_density_plot",
   "run_one_scenario"
 ), envir = environment())
 
