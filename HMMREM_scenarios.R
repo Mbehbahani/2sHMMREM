@@ -6,7 +6,7 @@
 # The 2-state HMM is ALWAYS fitted (for confidence metrics & accuracy)
 # TRUE  = full analysis (all HMM states + REM models)
 # FALSE = quick mode   (2-state HMM only, no REM)
-RUN_HMM_REM <- FALSE
+RUN_HMM_REM <- TRUE
 # -----------------------------------------------------------------------------
 # 1. Setup and Package Loading
 # -----------------------------------------------------------------------------
@@ -72,7 +72,7 @@ scenarios <- list(
     inertia1 = base_emissions$inertia1,
     inertia2 = base_emissions$inertia2,
     sep_factor = 1.0,
-    T_values = c(3000,300)
+    T_values = c(3000,600)
   ),
   Medium = list(
     name = "Medium",
@@ -127,7 +127,7 @@ for (sc_name in names(scenarios)) {
 }
 
 # Number of replications
-R <- 20
+R <- 10
 
 # Number of actors
 n_actors <- c(10)
@@ -772,20 +772,12 @@ create_overlap_plot <- function(all_hmm_results) {
 }
 
 # -----------------------------------------------------------------------------
-# 6. Main Execution  (Parallelised: one core per scenario)
+# 6. Main Execution  (Parallelised: one core per config)
 # -----------------------------------------------------------------------------
 
-# --- A: Group run_configs by scenario -------------------------------------------
-run_configs_by_scenario <- split(
-  run_configs,
-  sapply(run_configs, `[[`, "scenario_name")
-)
-
 # --- B: Worker function ---------------------------------------------------------
-# Identical loop body to the sequential version; only the outer container names
-# are function-local instead of global.  The single structural change is:
-#   for (config_name in names(run_configs))  -->  names(configs_for_scenario)
-run_one_scenario <- function(sc_key, configs_for_scenario) {
+# Each worker handles one scenario x T x N configuration.
+run_one_scenario <- function(config_name, config) {
 
   # Capture all cat() / message() output: PSOCK workers have no stdout connection.
   # Output is collected and returned to the master for printing.
@@ -805,11 +797,9 @@ run_one_scenario <- function(sc_key, configs_for_scenario) {
   all_rem_agg    <- list()
   all_diagnostics <- list()
 
-  for (config_name in names(configs_for_scenario)) {
-    config        <- configs_for_scenario[[config_name]]
-    scenario      <- config$scenario
-    scenario_name <- config$scenario_name
-    n_events      <- config$n_events
+  scenario      <- config$scenario
+  scenario_name <- config$scenario_name
+  n_events      <- config$n_events
   
   cat("\n", strrep("=", 60), "\n")
   cat("Running Config:", config_name, "\n")
@@ -1164,10 +1154,9 @@ run_one_scenario <- function(sc_key, configs_for_scenario) {
     all_results[[config_name]] <- list(scenario = config_name, replications = replications)
     # Always aggregate HMM results (2-state is always fitted)
     all_hmm_agg[[config_name]] <- aggregate_hmm_results(config_name, replications)
-    if (RUN_HMM_REM) {
-      all_rem_agg[[config_name]] <- aggregate_rem_results(replications)
-    }
-  }  # end for config_name
+  if (RUN_HMM_REM) {
+    all_rem_agg[[config_name]] <- aggregate_rem_results(replications)
+  }
 
   return(list(
     all_results     = all_results,
@@ -1193,7 +1182,7 @@ cat("  Logical cores available:", parallel::detectCores(), "\n")
 cat(strrep("=", 70), "\n")
 
 # --- D: Cluster setup (PSOCK – works on Windows and Linux) ----------------------
-n_cores <- min(4L, length(run_configs_by_scenario))
+n_cores <- min(4L, length(run_configs))
 cl <- parallel::makeCluster(n_cores, type = "PSOCK")
 results_list <- tryCatch({
 
@@ -1210,7 +1199,7 @@ parallel::clusterSetRNGStream(cl, iseed = 1234)
 # Export all helpers and shared parameters
 parallel::clusterExport(cl, varlist = c(
   "RUN_HMM_REM", "R", "tau1", "tau2", "states_to_fit",
-  "run_configs_by_scenario",
+  "run_configs",
   "simulate_hidden_states", "check_valid_states", "generate_valid_hidden_states",
   "compute_confidence_metrics", "fit_hmm_safe", "calculate_accuracy",
   "trapez_integrate", "compute_OVL_hist", "compute_OVL_kde", "compute_W1",
@@ -1220,22 +1209,22 @@ parallel::clusterExport(cl, varlist = c(
   "run_one_scenario"
 ), envir = environment())
 
-# --- E: Run one scenario per worker --------------------------------------------
-scenario_names_par <- names(run_configs_by_scenario)
+# --- E: Run one config per worker ----------------------------------------------
+config_names_par <- names(run_configs)
 cat("Starting", n_cores, "parallel workers...\n")
-out <- parallel::parLapply(cl, scenario_names_par, function(sn) {
-  run_one_scenario(sn, run_configs_by_scenario[[sn]])
+out <- parallel::parLapply(cl, config_names_par, function(config_name) {
+  run_one_scenario(config_name, run_configs[[config_name]])
 })
-names(out) <- scenario_names_par
+names(out) <- config_names_par
 out
 }, error = function(e) {
   message("PARALLEL ERROR: ", conditionMessage(e))
   message("Falling back to sequential execution...")
   # Run sequentially so results are not lost
   out <- list()
-  for (sn in names(run_configs_by_scenario)) {
-    cat("  Running scenario:", sn, "(sequential fallback)\n")
-    out[[sn]] <- run_one_scenario(sn, run_configs_by_scenario[[sn]])
+  for (config_name in names(run_configs)) {
+    cat("  Running config:", config_name, "(sequential fallback)\n")
+    out[[config_name]] <- run_one_scenario(config_name, run_configs[[config_name]])
   }
   out
 }, finally = {
