@@ -2,10 +2,10 @@
 # HMMREM Scenario Analysis: Easy, Medium, Hard, ExtremeHard
 # Systematic 3D design: Transition persistence × Emission separation × Sample size
 # =============================================================================
-# Toggle: Set to FALSE to skip extra HMM states (1,3,4) and REM fitting
+# Toggle: Set to FALSE to skip extra HMM states (1,3,4)
 # The 2-state HMM is ALWAYS fitted (for confidence metrics & accuracy)
-# TRUE  = full analysis (all HMM states + REM models)
-# FALSE = quick mode   (2-state HMM only, no REM)
+# TRUE  = extended HMM analysis (extra HMM states for the eligible config)
+# FALSE = quick mode            (2-state HMM only)
 RUN_HMM_REM <- TRUE
 # -----------------------------------------------------------------------------
 # 1. Setup and Package Loading
@@ -13,7 +13,7 @@ RUN_HMM_REM <- TRUE
 
 # Skip package loading if already loaded by runner script
 if (!exists("PACKAGES_LOADED_BY_RUNNER") || !PACKAGES_LOADED_BY_RUNNER) {
-  required_packages <- c("remstats", "remstimate", "dplyr", "ggplot2", 
+  required_packages <- c("dplyr", "ggplot2", 
                         "plotly", "momentuHMM", "remulate", "tidyr", "knitr")
   
   for (pkg in required_packages) {
@@ -72,7 +72,7 @@ scenarios <- list(
     inertia1 = base_emissions$inertia1,
     inertia2 = base_emissions$inertia2,
     sep_factor = 1.0,
-    T_values = c(500,3000)
+    T_values = c(3000,6000)
   ),
   Medium = list(
     name = "Medium",
@@ -85,7 +85,7 @@ scenarios <- list(
     inertia1 = base_emissions$inertia1,
     inertia2 = base_emissions$inertia2,
     sep_factor = 1.0,
-    T_values = c(500)
+    T_values = c(3000,6000)
   ),
   Hard = list(
     name = "Hard",
@@ -98,7 +98,7 @@ scenarios <- list(
     inertia1 = hard_emissions$inertia1,
     inertia2 = hard_emissions$inertia2,
     sep_factor = sep_factor_hard,
-    T_values = c(500)
+    T_values = c(3000,6000)
   ),
   ExtremeHard = list(
     name = "ExtremeHard",
@@ -111,7 +111,7 @@ scenarios <- list(
     inertia1 = hard_emissions$inertia1,
     inertia2 = hard_emissions$inertia2,
     sep_factor = sep_factor_hard,
-    T_values = c(500,1500)
+    T_values = c(3000,6000)
   )
 )
 
@@ -127,10 +127,10 @@ for (sc_name in names(scenarios)) {
 }
 
 # Number of replications
-R <- 3
+R <- 100
 
 # Number of actors
-n_actors <- c(10,15)
+n_actors <- c(10,15,20)
 
 # States to test in HMM fitting
 states_to_fit <- 1:4
@@ -1029,64 +1029,6 @@ run_one_scenario <- function(config_name, config) {
           })
         }
         
-        # For 2-state model, fit REM models only for the designated full config
-        if (m == 2 && run_full_config) {
-          events_df$predicted_state <- viterbi_states
-          means_by_group <- aggregate(Timedifferencees ~ predicted_state, 
-                                      data = events_df, FUN = mean)
-          sorted_index <- order(means_by_group$Timedifferencees, decreasing = TRUE)
-          events_df$state_indicator <- ifelse(events_df$predicted_state == sorted_index[2], 1, 0)
-          state_indicator <<- events_df$state_indicator
-          
-          reh_tie <- remify::remify(edgelist = events_df, model = "tie", 
-                                    actors = attr_actors$name, directed = TRUE, origin = 0)
-          
-          # Model 1: Simple REM
-          stats1 <- ~ 1 + difference("sex", scaling = "std") +
-            difference("age", scaling = "std") +
-            outdegreeReceiver(scaling = "std") +
-            inertia(scaling = "std")
-          
-          out1 <- remstats(reh = reh_tie, tie_effects = stats1, attr_actors = attr_actors)
-          fit1 <- remstimate::remstimate(reh = reh_tie, stats = out1, method = "MLE")
-          summary1 <- summary(fit1)
-          
-          rep_results$rem_results[["simple"]] <- list(
-            model = "Simple REM", coefs = summary1$coefsTab,
-            bic = summary1$BIC, aic = summary1$AIC
-          )
-          
-          # Model 2: REM with State effect
-          stats2 <- ~ 1 + difference("sex", scaling = "std") +
-            difference("age", scaling = "std") +
-            outdegreeReceiver(scaling = "std") +
-            inertia(scaling = "std") +
-            (event(x = state_indicator, "PredictedState1"))
-          
-          out2 <- remstats(reh = reh_tie, tie_effects = stats2, attr_actors = attr_actors)
-          fit2 <- remstimate::remstimate(reh = reh_tie, stats = out2, method = "MLE")
-          summary2 <- summary(fit2)
-          
-          rep_results$rem_results[["state"]] <- list(
-            model = "REM + State", coefs = summary2$coefsTab,
-            bic = summary2$BIC, aic = summary2$AIC
-          )
-          
-          # Model 3: REM with Interaction effect
-          stats3 <- ~ 1 + difference("sex", scaling = "std") +
-            difference("age", scaling = "std") +
-            (outdegreeReceiver(scaling = "std") + inertia(scaling = "std")) :
-            (event(x = state_indicator, "PredictedState1"))
-          
-          out3 <- remstats(reh = reh_tie, tie_effects = stats3, attr_actors = attr_actors)
-          fit3 <- remstimate::remstimate(reh = reh_tie, stats = out3, method = "MLE")
-          summary3 <- summary(fit3)
-          
-          rep_results$rem_results[["interaction"]] <- list(
-            model = "REM + Interaction", coefs = summary3$coefsTab,
-            bic = summary3$BIC, aic = summary3$AIC
-          )
-        }
       } else {
         cat("Failed\n")
         rep_results$hmm_results[[paste0("m", m)]] <- list(
@@ -1161,10 +1103,6 @@ run_one_scenario <- function(config_name, config) {
     all_results[[config_name]] <- list(scenario = config_name, replications = replications)
     # Always aggregate HMM results (2-state is always fitted)
     all_hmm_agg[[config_name]] <- aggregate_hmm_results(config_name, replications)
-  if (run_full_config) {
-    all_rem_agg[[config_name]] <- aggregate_rem_results(replications)
-  }
-
   return(list(
     all_results     = all_results,
     all_hmm_agg    = all_hmm_agg,
@@ -1184,7 +1122,7 @@ cat("  Configs:", length(run_configs), "total (",
 cat("  Actor counts:", paste(n_actors_values, collapse = ", "), "\n")
 cat("  Replications:", R, "\n")
 cat("  States to fit: 1, 2, 3, 4\n")
-cat("  Mode:", ifelse(RUN_HMM_REM, "FULL (all HMM states + REM)", "QUICK (2-state HMM only, no REM)"), "\n")
+cat("  Mode:", ifelse(RUN_HMM_REM, "FULL HMM (all HMM states, no REM)", "QUICK (2-state HMM only)"), "\n")
 cat("  Logical cores available:", parallel::detectCores(), "\n")
 cat(strrep("=", 70), "\n")
 
@@ -1194,7 +1132,6 @@ cl <- parallel::makeCluster(n_cores, type = "PSOCK")
 results_list <- tryCatch({
 
 parallel::clusterEvalQ(cl, {
-  library(remstats);   library(remstimate); library(remify)
   library(dplyr);      library(ggplot2);    library(momentuHMM)
   library(remulate);   library(tidyr);      library(knitr)
   invisible(NULL)
@@ -1211,7 +1148,7 @@ parallel::clusterExport(cl, varlist = c(
   "compute_confidence_metrics", "fit_hmm_safe", "calculate_accuracy",
   "trapez_integrate", "compute_OVL_hist", "compute_OVL_kde", "compute_W1",
   "infer_step_param_type", "compute_parametric_overlap", "compute_state_overlap",
-  "aggregate_hmm_results", "aggregate_rem_results",
+  "aggregate_hmm_results",
   "create_density_plot",
   "run_one_scenario"
 ), envir = environment())
@@ -1265,8 +1202,6 @@ full_config_names <- names(run_configs)[vapply(run_configs, function(cfg) {
   identical(cfg$n_actors, 15) && identical(cfg$n_events, 3000)
 }, logical(1))]
 full_hmm_agg <- all_hmm_agg[full_config_names[full_config_names %in% names(all_hmm_agg)]]
-full_rem_agg <- all_rem_agg[full_config_names[full_config_names %in% names(all_rem_agg)]]
-
 # --- Validation: confirm merge produced actual data -----------------------------
 cat("\nMerge summary:\n")
 cat("  all_results    :", length(all_results),     "configs\n")
@@ -1282,8 +1217,8 @@ if (length(all_hmm_agg) == 0)
 if (!RUN_HMM_REM) {
   cat("\n\nQuick mode (RUN_HMM_REM = FALSE).\n")
   cat("2-state HMM fitted (confidence metrics & accuracy available).\n")
-  cat("Extra HMM states (1,3,4) and REM models were skipped.\n")
-  cat("Set RUN_HMM_REM <- TRUE and re-run for full analysis.\n\n")
+  cat("Extra HMM states (1,3,4) were skipped.\n")
+  cat("Set RUN_HMM_REM <- TRUE and re-run for extended HMM fitting.\n\n")
   
   # Print 2-state confidence summary
   combined_hmm <- do.call(rbind, all_hmm_agg)
@@ -1347,7 +1282,7 @@ if (!RUN_HMM_REM) {
   assign("RUN_HMM_REM", RUN_HMM_REM, envir = .GlobalEnv)
   
 } else {
-# Full results when HMM/REM fitting was enabled
+# Full results when extended HMM fitting was enabled
 
 cat("\n\n", strrep("=", 70), "\n")
 cat("  AGGREGATED RESULTS\n")
@@ -1355,7 +1290,7 @@ cat(strrep("=", 70), "\n")
 
 if (length(full_hmm_agg) == 0) {
   cat("No eligible full-analysis configs found for N = 15 and T = 3000.\n")
-  cat("Skipping Model_Selection, REM summaries, and full-mode figures.\n")
+  cat("Skipping extended HMM summaries and full-mode figures.\n")
 } else {
 combined_hmm <- do.call(rbind, full_hmm_agg)
 
@@ -1367,26 +1302,6 @@ print(knitr::kable(combined_hmm[, c("Scenario", "States", "BIC_mean", "BIC_sd",
                    col.names = c("Scenario", "States", "BIC (mean)", "BIC (sd)",
                                  "Confidence", paste0("% Unc (tau=", tau1, ")"), 
                                  paste0("% Unc (tau=", tau2, ")"), "Accuracy")))
-
-cat("\n\n--- REM Coefficient Estimates (2-State Model) ---\n")
-
-for (scenario_name in names(full_rem_agg)) {
-  cat("\n", strrep("-", 50), "\n")
-  cat("Scenario:", scenario_name, "\n")
-  cat(strrep("-", 50), "\n")
-  
-  rem_results <- full_rem_agg[[scenario_name]]
-  
-  if (!is.null(rem_results)) {
-    for (model_name in names(rem_results)) {
-      cat("\n  Model:", rem_results[[model_name]]$model, "\n")
-      cat("  BIC: ", round(rem_results[[model_name]]$bic_mean, 2), 
-          " (", round(rem_results[[model_name]]$bic_sd, 2), ")\n", sep = "")
-      cat("\n")
-      print(knitr::kable(rem_results[[model_name]]$coefficients, digits = 3))
-    }
-  }
-}
 
 # -----------------------------------------------------------------------------
 # 8. Generate Figures
@@ -1482,7 +1397,6 @@ cat("\n\nAnalysis complete!\n")
 
 # Ensure all results are available in global environment
 assign("all_hmm_agg", all_hmm_agg, envir = .GlobalEnv)
-assign("all_rem_agg", all_rem_agg, envir = .GlobalEnv)
 assign("all_results", all_results, envir = .GlobalEnv)
 assign("all_diagnostics", all_diagnostics, envir = .GlobalEnv)
 assign("scenarios", scenarios, envir = .GlobalEnv)
@@ -1494,4 +1408,4 @@ assign("tau1", tau1, envir = .GlobalEnv)
 assign("tau2", tau2, envir = .GlobalEnv)
 assign("RUN_HMM_REM", RUN_HMM_REM, envir = .GlobalEnv)
 
-} # end of if (RUN_HMM_REM) full results block
+} # end of if (RUN_HMM_REM) extended HMM results block

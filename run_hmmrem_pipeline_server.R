@@ -30,31 +30,35 @@ install_if_missing <- function(pkgs) {
   
   if (length(missing) > 0) {
     cat("Missing packages:", paste(missing, collapse = ", "), "\n\n")
-    
-    for (pkg in missing) {
-      cat("Installing", pkg, "... ")
-      result <- tryCatch({
-        # Force binary installation first (much faster, no compilation)
-        install.packages(pkg, dependencies = TRUE, quiet = TRUE, 
-                        INSTALL_opts = "--no-test-load")
-        if (requireNamespace(pkg, quietly = TRUE)) {
-          cat("OK\n")
-          TRUE
-        } else {
-          cat("FAILED\n")
-          FALSE
-        }
-      }, error = function(e) {
-        cat("ERROR:", conditionMessage(e), "\n")
-        FALSE
-      })
-      
-      if (!result) {
-        stop(paste("Failed to install required package:", pkg, 
-                  "\nTry running manually: install.packages('", pkg, "')"))
-      }
+
+    if (!requireNamespace("pak", quietly = TRUE)) {
+      cat("Installing pak...\n")
+      install.packages("pak")
     }
-    cat("\nAll missing packages installed successfully.\n")
+
+    cat("Installing missing packages with pak::pak()...\n")
+    tryCatch({
+      pak::pak(missing)
+    }, error = function(e) {
+      stop(
+        paste0(
+          "Failed to install required packages with pak::pak(): ",
+          conditionMessage(e)
+        )
+      )
+    })
+
+    still_missing <- missing[!vapply(missing, requireNamespace, logical(1), quietly = TRUE)]
+    if (length(still_missing) > 0) {
+      stop(
+        paste0(
+          "These packages are still unavailable after pak::pak(): ",
+          paste(still_missing, collapse = ", ")
+        )
+      )
+    }
+
+    cat("All missing packages installed successfully.\n")
   } else {
     cat("All required packages are already installed.\n")
   }

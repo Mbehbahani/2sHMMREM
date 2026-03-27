@@ -10,7 +10,7 @@
 # Skip package loading if already loaded by runner script
 if (!exists("PACKAGES_LOADED_BY_RUNNER") || !PACKAGES_LOADED_BY_RUNNER) {
   # Check and install required packages
-  required_packages <- c("remstats", "remstimate", "dplyr", "ggplot2", 
+  required_packages <- c("dplyr", "ggplot2", 
                          "plotly", "momentuHMM", "remulate", "tidyr", 
                          "knitr", "openxlsx")
   
@@ -79,10 +79,6 @@ if (!hmm_available) {
     }
   }
 }
-# REM + extra HMM states are only available in full mode (RUN_HMM_REM = TRUE)
-rem_available <- hmm_available && exists("RUN_HMM_REM") && RUN_HMM_REM &&
-                 exists("all_rem_agg") && length(all_rem_agg) > 0
-
 # -----------------------------------------------------------------------------
 # 3. Prepare data for Excel export
 # -----------------------------------------------------------------------------
@@ -107,7 +103,7 @@ summary_info <- data.frame(
             if (exists("RUN_HMM_REM") && RUN_HMM_REM) paste(states_to_fit, collapse = ", ") else "2", tau1, tau2,
             paste(names(scenarios), collapse = ", "),
             paste(length(run_configs), "total"),
-            "Simple REM, REM + State, REM + Interaction")
+            "Disabled")
 )
 
 writeData(wb, "Summary", summary_info, startRow = 1, startCol = 1)
@@ -251,92 +247,8 @@ if (length(existing_overlap_cols) > 0) {
   cat("  No HMM results available. Sheets 4-6 (HMM_Results, Confidence_Metrics, State_Overlap) skipped.\n")
 }
 
-# -----------------------------------------------------------------------------
-# Sheets 6+: Model Selection, REM results (only in full mode)
-# -----------------------------------------------------------------------------
-
-if (rem_available) {
-
-# Sheet 6: Model Selection (Best HMM per scenario)
-addWorksheet(wb, "Model_Selection")
-
-best_models <- hmm_combined %>%
-  group_by(Config) %>%
-  slice_min(order_by = BIC_mean, n = 1) %>%
-  ungroup() %>%
-  select(Config, Best_States = States, BIC_mean, BIC_sd)
-
-model_selection <- hmm_combined %>%
-  left_join(best_models %>% select(Config, Best_BIC = BIC_mean), by = "Config") %>%
-  mutate(Delta_BIC = BIC_mean - Best_BIC) %>%
-  select(Config, Scenario, T, N, States, BIC_mean, BIC_sd, Delta_BIC)
-
-writeData(wb, "Model_Selection", model_selection, startRow = 1, startCol = 1)
-
-# Sheet 7: All REM Coefficients Combined
-addWorksheet(wb, "REM_All_Coefficients")
-
-all_coefs_list <- list()
-for (config_name in names(run_configs)) {
-  rem_results <- all_rem_agg[[config_name]]
-  if (!is.null(rem_results)) {
-    for (model_name in names(rem_results)) {
-      model_data <- rem_results[[model_name]]
-      coefs_df <- model_data$coefficients
-      coefs_df$Config <- config_name
-      coefs_df$Model <- model_data$model
-      coefs_df$BIC_mean <- model_data$bic_mean
-      all_coefs_list[[paste(config_name, model_name, sep = "_")]] <- coefs_df
-    }
-  }
-}
-
-if (length(all_coefs_list) > 0) {
-  all_coefs_combined <- do.call(rbind, all_coefs_list) %>%
-    left_join(config_lookup, by = "Config") %>%
-    select(Config, Scenario, T, N, Model, Variable, everything())
-  
-  writeData(wb, "REM_All_Coefficients", all_coefs_combined, startRow = 1, startCol = 1)
-} else {
-  writeData(wb, "REM_All_Coefficients",
-            data.frame(Note = "No REM coefficients available for export."),
-            startRow = 1, startCol = 1)
-}
-
-# Sheets 8+: REM Results per Configuration
-for (config_name in names(run_configs)) {
-  sheet_name <- paste0("REM_", config_name)
-  addWorksheet(wb, sheet_name)
-  
-  rem_results <- all_rem_agg[[config_name]]
-  config_row <- config_lookup %>% filter(Config == config_name)
-  
-  if (!is.null(rem_results)) {
-    writeData(wb, sheet_name, config_row, startRow = 1, startCol = 1)
-    current_row <- 3
-    for (model_name in names(rem_results)) {
-      model_data <- rem_results[[model_name]]
-      
-      writeData(wb, sheet_name, data.frame(Model = model_data$model), 
-                startRow = current_row, startCol = 1)
-      current_row <- current_row + 1
-      
-      bic_info <- data.frame(Metric = c("BIC_mean", "BIC_sd"),
-                             Value = c(model_data$bic_mean, model_data$bic_sd))
-      writeData(wb, sheet_name, bic_info, startRow = current_row, startCol = 1)
-      current_row <- current_row + 3
-      
-      writeData(wb, sheet_name, model_data$coefficients, 
-                startRow = current_row, startCol = 1)
-      current_row <- current_row + nrow(model_data$coefficients) + 3
-    }
-  }
-}
-
-} else {
-  cat("  REM fitting was not performed (quick mode).\n")
-  cat("  Sheets 6-8+ (Model_Selection, REM_*, REM_All_Coefficients) skipped.\n")
-}
+cat("  REM fitting is disabled.\n")
+cat("  Model_Selection and REM_* sheets are skipped.\n")
 
 # -----------------------------------------------------------------------------
 # Save Excel file
@@ -362,21 +274,7 @@ if (hmm_available) {
   cat("  6. State_Overlap - State overlap diagnostics (2-state model)\n")
 }
 
-if (rem_available) {
-  cat("  7. Model_Selection - Best model selection with delta BIC\n")
-  cat("  8. REM_All_Coefficients - Combined REM results for comparison\n")
-
-  # Individual REM sheets start from index 9
-  rem_start_idx <- 9
-  for (i in seq_along(names(run_configs))) {
-    idx <- rem_start_idx + (i - 1)
-    cat("  ", idx, ". REM_", names(run_configs)[i], " - REM coefficients for ", names(run_configs)[i], "\n", sep = "")
-  }
-}
-
 if (!hmm_available) {
   cat("  (No HMM results: sheets 4-6 skipped)\n")
 }
-if (!rem_available) {
-  cat("  (Quick mode: sheets 6-8+ REM/Model_Selection skipped)\n")
-}
+cat("  (REM-related sheets disabled)\n")
