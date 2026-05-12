@@ -391,8 +391,8 @@ write_density_plots <- function(density_dir = "density_data", plot_dir = file.pa
     }
 
     p_density <- create_density_plot(density_df)
-    output_path <- file.path(plot_dir, paste0("density_", config_name, ".svg"))
-    ggsave(output_path, p_density, device = "svg", width = 8, height = 5, bg = "white")
+    output_path <- file.path(plot_dir, paste0("density_", config_name, ".png"))
+    ggsave(output_path, p_density, width = 8, height = 5, bg = "white")
     saved_paths[[i]] <- output_path
   }
 

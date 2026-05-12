@@ -14,7 +14,8 @@ RUN_HMM_REM <- TRUE
 # Skip package loading if already loaded by runner script
 if (!exists("PACKAGES_LOADED_BY_RUNNER") || !PACKAGES_LOADED_BY_RUNNER) {
   required_packages <- c("dplyr", "ggplot2", 
-                        "plotly", "momentuHMM", "remulate", "tidyr", "knitr")
+                        "plotly", "momentuHMM", "remulate", "tidyr", "knitr",
+                        "remify", "remstats", "remstimate")
   
   for (pkg in required_packages) {
     if (!requireNamespace(pkg, quietly = TRUE)) {
@@ -77,7 +78,7 @@ scenarios <- list(
   Medium = list(
     name = "Medium",
     transition_probs = matrix(c(0.9, 0.1,
-                                0.15, 0.85), nrow = 2, byrow = TRUE),
+                                0.1, 0.9), nrow = 2, byrow = TRUE),
     baseline1 = base_emissions$baseline1,
     baseline2 = base_emissions$baseline2,
     outdegree1 = base_emissions$outdegree1,
@@ -85,12 +86,12 @@ scenarios <- list(
     inertia1 = base_emissions$inertia1,
     inertia2 = base_emissions$inertia2,
     sep_factor = 1.0,
-    T_values = c(3000,6000)
+    T_values = c(3000, 6000)
   ),
   Hard = list(
     name = "Hard",
     transition_probs = matrix(c(0.9, 0.1,
-                                0.15, 0.85), nrow = 2, byrow = TRUE),
+                                0.1, 0.9), nrow = 2, byrow = TRUE),
     baseline1 = hard_emissions$baseline1,
     baseline2 = hard_emissions$baseline2,
     outdegree1 = hard_emissions$outdegree1,
@@ -98,12 +99,12 @@ scenarios <- list(
     inertia1 = hard_emissions$inertia1,
     inertia2 = hard_emissions$inertia2,
     sep_factor = sep_factor_hard,
-    T_values = c(3000,6000)
+    T_values = c(3000, 6000)
   ),
   ExtremeHard = list(
     name = "ExtremeHard",
     transition_probs = matrix(c(0.75, 0.25,
-                                0.30, 0.70), nrow = 2, byrow = TRUE),
+                                0.25, 0.75), nrow = 2, byrow = TRUE),
     baseline1 = hard_emissions$baseline1,
     baseline2 = hard_emissions$baseline2,
     outdegree1 = hard_emissions$outdegree1,
@@ -111,7 +112,7 @@ scenarios <- list(
     inertia1 = hard_emissions$inertia1,
     inertia2 = hard_emissions$inertia2,
     sep_factor = sep_factor_hard,
-    T_values = c(3000,6000)
+    T_values = c(3000, 6000 )
   )
 )
 
@@ -255,6 +256,49 @@ calculate_accuracy <- function(true_states, predicted_states, n_states) {
   predicted_flipped <- ifelse(predicted_states == 1, 2, 1)
   acc2 <- mean(true_states == predicted_flipped) * 100
   return(max(acc1, acc2))
+}
+
+fit_state_rem_safe <- function(events_df, attr_actors) {
+  tryCatch({
+    predicted_state_indicator <<- events_df$column1
+    on.exit({
+      if (exists("predicted_state_indicator", envir = .GlobalEnv)) {
+        rm(predicted_state_indicator, envir = .GlobalEnv)
+      }
+    }, add = TRUE)
+
+    reh_tie <- remify::remify(
+      edgelist = events_df,
+      model = "tie",
+      actors = attr_actors$name,
+      directed = TRUE,
+      origin = 0
+    )
+    
+    stats <- ~ 1 +
+      remstats::difference("sex", scaling = "std") +
+      remstats::difference("age", scaling = "std") +
+      remstats::outdegreeReceiver(scaling = "std") +
+      remstats::inertia(scaling = "std") +
+      remstats::event(x = predicted_state_indicator, "PredictedState1") +
+      remstats::outdegreeReceiver(scaling = "std") :
+        remstats::event(x = predicted_state_indicator, "PredictedState1") +
+      remstats::inertia(scaling = "std") :
+        remstats::event(x = predicted_state_indicator, "PredictedState1")
+    
+    out <- remstats::remstats(reh = reh_tie, tie_effects = stats, attr_actors = attr_actors)
+    fit <- remstimate::remstimate(reh = reh_tie, stats = out, method = "MLE")
+    fit_summary <- summary(fit)
+    
+    list(
+      model = "HMREM_interaction",
+      coefs = fit_summary$coefsTab,
+      bic = fit_summary$BIC
+    )
+  }, error = function(e) {
+    message("    REM fitting failed: ", e$message)
+    NULL
+  })
 }
 
 # -----------------------------------------------------------------------------
@@ -613,7 +657,22 @@ aggregate_hmm_results <- function(scenario_name, replications) {
   return(agg_results)
 }
 
-aggregate_rem_results <- function(replications) {
+get_true_rem_values <- function(config_name) {
+  scenario <- run_configs[[config_name]]$scenario
+
+  c(
+    baseline = scenario$baseline1,
+    difference_age = 0.4,
+    difference_sex = 0.3,
+    event_PredictedState1 = scenario$baseline2 - scenario$baseline1,
+    inertia = scenario$inertia1,
+    `inertia:event_PredictedState1` = scenario$inertia2 - scenario$inertia1,
+    outdegreeReceiver = scenario$outdegree1,
+    `outdegreeReceiver:event_PredictedState1` = scenario$outdegree2 - scenario$outdegree1
+  )
+}
+
+aggregate_rem_results <- function(config_name, replications) {
   # Remove any NULL entries (skipped iterations)
   replications <- Filter(Negate(is.null), replications)
   n_rep <- length(replications)
@@ -647,9 +706,14 @@ aggregate_rem_results <- function(replications) {
                    pvalue = pvalues)
       }
     })
+
+    all_coefs <- Filter(Negate(is.null), all_coefs)
+    if (length(all_coefs) == 0) next
     
     combined <- do.call(rbind, all_coefs)
     
+    true_values <- get_true_rem_values(config_name)
+
     agg <- combined %>%
       group_by(Variable) %>%
       summarize(
@@ -662,10 +726,38 @@ aggregate_rem_results <- function(replications) {
         pvalue_sd = sd(pvalue, na.rm = TRUE),
         log10_pvalue_mean = mean(-log10(pvalue), na.rm = TRUE),
         sig_rate = mean(pvalue < 0.05, na.rm = TRUE) * 100,
+        SE_to_SD_ratio = ifelse(sd(Estimate, na.rm = TRUE) > 0,
+                                mean(SE, na.rm = TRUE) / sd(Estimate, na.rm = TRUE),
+                                NA_real_),
+        SD_to_SE_ratio = ifelse(mean(SE, na.rm = TRUE) > 0,
+                                sd(Estimate, na.rm = TRUE) / mean(SE, na.rm = TRUE),
+                                NA_real_),
+        .groups = 'drop'
+      ) %>%
+      mutate(
+        True_value = unname(true_values[Variable]),
+        Bias = Estimate_mean - True_value,
+        RMSE = sqrt(Bias^2 + Estimate_sd^2)
+      )
+
+    coverage_df <- combined %>%
+      mutate(True_value = unname(true_values[Variable])) %>%
+      group_by(Variable) %>%
+      summarize(
+        Coverage_95 = mean(
+          (Estimate - 1.96 * SE <= True_value) &
+            (True_value <= Estimate + 1.96 * SE),
+          na.rm = TRUE
+        ) * 100,
         .groups = 'drop'
       )
+
+    agg <- agg %>% left_join(coverage_df, by = "Variable")
     
-    bics <- sapply(seq_len(n_rep), function(i) replications[[i]]$rem_results[[model]]$bic)
+    bics <- sapply(seq_len(n_rep), function(i) {
+      res <- replications[[i]]$rem_results[[model]]
+      if (is.null(res)) NA_real_ else res$bic
+    })
     
     all_rem_results[[model]] <- list(
       model = replications[[1]]$rem_results[[model]]$model,
@@ -674,7 +766,79 @@ aggregate_rem_results <- function(replications) {
       bic_sd = sd(bics, na.rm = TRUE)
     )
   }
+  if (length(all_rem_results) == 0) return(NULL)
   return(all_rem_results)
+}
+
+build_rem_uncertainty_summary <- function(rem_results_list, model_name = "HMREM_interaction") {
+  rem_results_list <- Filter(Negate(is.null), rem_results_list)
+  if (length(rem_results_list) == 0) return(NULL)
+
+  rows <- lapply(names(rem_results_list), function(config_name) {
+    config_res <- rem_results_list[[config_name]]
+    if (is.null(config_res[[model_name]])) return(NULL)
+
+    coef_df <- config_res[[model_name]]$coefficients
+    if (is.null(coef_df) || nrow(coef_df) == 0) return(NULL)
+
+    data.frame(
+      Config = config_name,
+      Scenario = run_configs[[config_name]]$scenario_name,
+      T = run_configs[[config_name]]$n_events,
+      N = run_configs[[config_name]]$n_actors,
+      Variable = coef_df$Variable,
+      True_value = coef_df$True_value,
+      Estimate_mean = coef_df$Estimate_mean,
+      Bias = coef_df$Bias,
+      RMSE = coef_df$RMSE,
+      Empirical_SD = coef_df$Estimate_sd,
+      Reported_SE = coef_df$SE_mean,
+      Coverage_95 = coef_df$Coverage_95,
+      SE_to_SD_ratio = coef_df$SE_to_SD_ratio,
+      SD_to_SE_ratio = coef_df$SD_to_SE_ratio,
+      sig_rate = coef_df$sig_rate
+    )
+  })
+
+  rows <- Filter(Negate(is.null), rows)
+  if (length(rows) == 0) return(NULL)
+
+  dplyr::bind_rows(rows)
+}
+
+save_analysis_bundle <- function(bundle_path = "hmmrem_analysis_bundle.rds",
+                                 all_results,
+                                 all_hmm_agg,
+                                 all_diagnostics,
+                                 all_rem_agg,
+                                 scenarios,
+                                 run_configs,
+                                 R,
+                                 n_actors,
+                                 states_to_fit,
+                                 tau1,
+                                 tau2,
+                                 RUN_HMM_REM) {
+  bundle <- list(
+    bundle_version = 1L,
+    generated_at_utc = format(Sys.time(), tz = "UTC", usetz = TRUE),
+    all_results = all_results,
+    all_hmm_agg = all_hmm_agg,
+    all_diagnostics = all_diagnostics,
+    all_rem_agg = all_rem_agg,
+    scenarios = scenarios,
+    run_configs = run_configs,
+    R = R,
+    n_actors = n_actors,
+    states_to_fit = states_to_fit,
+    tau1 = tau1,
+    tau2 = tau2,
+    RUN_HMM_REM = RUN_HMM_REM
+  )
+
+  saveRDS(bundle, bundle_path)
+  cat("Saved analysis bundle:", bundle_path, "\n")
+  invisible(bundle_path)
 }
 
 # -----------------------------------------------------------------------------
@@ -776,8 +940,8 @@ create_overlap_plot <- function(all_hmm_results) {
 # -----------------------------------------------------------------------------
 
 # --- B: Worker function ---------------------------------------------------------
-# Each worker handles one scenario x T x N configuration.
-run_one_scenario <- function(config_name, config) {
+# Each worker handles one or more replications for a single configuration.
+run_replication_batch <- function(config_name, config, iter_ids) {
 
   # Capture all cat() / message() output: PSOCK workers have no stdout connection.
   # Output is collected and returned to the master for printing.
@@ -792,17 +956,12 @@ run_one_scenario <- function(config_name, config) {
   }, add = TRUE)
 
 
-  all_results     <- list()
-  all_hmm_agg    <- list()
-  all_rem_agg    <- list()
-  all_diagnostics <- list()
-
   scenario      <- config$scenario
   scenario_name <- config$scenario_name
   n_events      <- config$n_events
   
   cat("\n", strrep("=", 60), "\n")
-  cat("Running Config:", config_name, "\n")
+  cat("Running Config:", config_name, "| Replications:", paste(iter_ids, collapse = ", "), "\n")
   cat("Scenario:", scenario_name, "| T =", n_events, "| N =", config$n_actors, "\n")
   cat("Dwell times: State1 =", round(scenario$dwell_time[1], 2),
       ", State2 =", round(scenario$dwell_time[2], 2), "\n")
@@ -814,7 +973,7 @@ run_one_scenario <- function(config_name, config) {
   density_storage <- list()
   run_full_config <- isTRUE(RUN_HMM_REM) && identical(config$n_actors, 15) && identical(n_events, 3000)
   
-  for (iter in 1:R) {
+  for (iter in iter_ids) {
     cat("  Replication", iter, "\n")
     
     # Create actor attributes - <<- assigns to worker's .GlobalEnv so remulate formulas find it
@@ -1027,6 +1186,32 @@ run_one_scenario <- function(config_name, config) {
           }, error = function(e) {
             message("    Could not collect density data: ", e$message)
           })
+
+          rem_fit <- tryCatch({
+            events_df$Predicted <- viterbi_states
+            means_by_group <- aggregate(Timedifferencees ~ Predicted, data = events_df, FUN = mean)
+            
+            if (nrow(means_by_group) != 2) {
+              stop("Predicted states do not contain two non-empty groups for REM fitting.")
+            }
+            
+            high_state_label <- means_by_group$Predicted[
+              order(means_by_group$Timedifferencees, decreasing = TRUE)
+            ][2]
+            events_df$column1 <- ifelse(events_df$Predicted == high_state_label, 1, 0)
+            
+            fit_state_rem_safe(events_df, attr_actors)
+          }, error = function(e) {
+            message("    REM preparation failed: ", e$message)
+            NULL
+          })
+
+          if (!is.null(rem_fit)) {
+            rep_results$rem_results[["HMREM_interaction"]] <- rem_fit
+            cat("      REM: Done (BIC:", round(rem_fit$bic, 2), ")\n")
+          } else {
+            cat("      REM: Failed\n")
+          }
         }
         
       } else {
@@ -1041,32 +1226,50 @@ run_one_scenario <- function(config_name, config) {
     replications[[length(replications) + 1]] <- rep_results
   }
   
+  return(list(
+    config_name = config_name,
+    replications = replications,
+    density_storage = density_storage,
+    log = log_lines
+  ))
+}  # end run_replication_batch
+
+finalize_config_results <- function(config_name, config, replications, density_storage) {
+  all_results      <- list()
+  all_hmm_agg      <- list()
+  all_rem_agg      <- list()
+  all_diagnostics  <- list()
+
+  scenario      <- config$scenario
+  scenario_name <- config$scenario_name
+  n_events      <- config$n_events
+
   # --- Aggregate and save density data -----------------------------------------
   if (length(density_storage) > 0) {
     tryCatch({
       combined_density <- dplyr::bind_rows(density_storage)
-      
+
       density_data_dir <- "density_data"
       dir.create(density_data_dir, showWarnings = FALSE, recursive = TRUE)
-      
+
       density_rds_path <- file.path(density_data_dir, paste0("density_data_", config_name, ".rds"))
       saveRDS(combined_density, density_rds_path)
       cat("  Saved density data:", density_rds_path, "\n")
-      
+
       density_plot_dir <- file.path("plots", "density")
       dir.create(density_plot_dir, showWarnings = FALSE, recursive = TRUE)
-      
+
       p_density <- create_density_plot(combined_density)
-      density_svg_path <- file.path(density_plot_dir, paste0("density_", config_name, ".svg"))
-      ggsave(density_svg_path, p_density, device = "svg", 
+      density_png_path <- file.path(density_plot_dir, paste0("density_", config_name, ".png"))
+      ggsave(density_png_path, p_density,
              width = 8, height = 5, bg = "white")
-      cat("  Saved density plot:", density_svg_path, "\n")
-      
+      cat("  Saved density plot:", density_png_path, "\n")
+
     }, error = function(e) {
       message("  Could not aggregate/save density data: ", e$message)
     })
   }
-  
+
   # --- Guard against empty replications (all iterations skipped) ---------------
   if (length(replications) == 0) {
     cat("  WARNING: All", R, "replications failed for", config_name, "-- skipping config\n")
@@ -1081,12 +1284,10 @@ run_one_scenario <- function(config_name, config) {
       all_results = all_results,
       all_hmm_agg = all_hmm_agg,
       all_diagnostics = all_diagnostics,
-      all_rem_agg = all_rem_agg,
-      log = log_lines
+      all_rem_agg = all_rem_agg
     ))
   }
 
-  # Compute diagnostics
   rho_hats <- as.numeric(sapply(replications, function(rep) rep$rho_hat))
   all_diagnostics[[config_name]] <- list(
     scenario = scenario_name,
@@ -1100,17 +1301,36 @@ run_one_scenario <- function(config_name, config) {
   )
   cat("  Mean rho_hat:", round(mean(rho_hats, na.rm = TRUE), 4), "\n")
 
-    all_results[[config_name]] <- list(scenario = config_name, replications = replications)
-    # Always aggregate HMM results (2-state is always fitted)
-    all_hmm_agg[[config_name]] <- aggregate_hmm_results(config_name, replications)
-  return(list(
-    all_results     = all_results,
-    all_hmm_agg    = all_hmm_agg,
+  all_results[[config_name]] <- list(scenario = config_name, replications = replications)
+  all_hmm_agg[[config_name]] <- aggregate_hmm_results(config_name, replications)
+  all_rem_agg[[config_name]] <- aggregate_rem_results(config_name, replications)
+
+  list(
+    all_results = all_results,
+    all_hmm_agg = all_hmm_agg,
     all_diagnostics = all_diagnostics,
-    all_rem_agg    = all_rem_agg,
-    log             = log_lines     # captured console output
-  ))
-}  # end run_one_scenario
+    all_rem_agg = all_rem_agg
+  )
+}
+
+combine_task_results <- function(task_results) {
+  results_list <- list()
+
+  for (config_name in names(run_configs)) {
+    matching_results <- Filter(function(res) identical(res$config_name, config_name), task_results)
+    replications <- unlist(lapply(matching_results, `[[`, "replications"), recursive = FALSE, use.names = FALSE)
+    density_storage <- unlist(lapply(matching_results, `[[`, "density_storage"), recursive = FALSE, use.names = FALSE)
+
+    results_list[[config_name]] <- finalize_config_results(
+      config_name,
+      run_configs[[config_name]],
+      replications,
+      density_storage
+    )
+  }
+
+  results_list
+}
 
 # --- C: Announce ---------------------------------------------------------------
 cat("\n", strrep("=", 70), "\n")
@@ -1127,13 +1347,21 @@ cat("  Logical cores available:", parallel::detectCores(), "\n")
 cat(strrep("=", 70), "\n")
 
 # --- D: Cluster setup (PSOCK – works on Windows and Linux) ----------------------
-n_cores <- min(parallel::detectCores(), length(run_configs))
+task_list <- unlist(lapply(names(run_configs), function(config_name) {
+  lapply(seq_len(R), function(iter_id) {
+    list(config_name = config_name, iter_ids = iter_id)
+  })
+}), recursive = FALSE)
+
+SERVER_CORES <- 200
+n_cores <- min(SERVER_CORES, length(task_list))
 cl <- parallel::makeCluster(n_cores, type = "PSOCK")
-results_list <- tryCatch({
+task_results <- tryCatch({
 
 parallel::clusterEvalQ(cl, {
   library(dplyr);      library(ggplot2);    library(momentuHMM)
   library(remulate);   library(tidyr);      library(knitr)
+  library(remify);     library(remstats);   library(remstimate)
   invisible(NULL)
 })
 
@@ -1146,30 +1374,28 @@ parallel::clusterExport(cl, varlist = c(
   "run_configs",
   "simulate_hidden_states", "check_valid_states", "generate_valid_hidden_states",
   "compute_confidence_metrics", "fit_hmm_safe", "calculate_accuracy",
+  "fit_state_rem_safe",
   "trapez_integrate", "compute_OVL_hist", "compute_OVL_kde", "compute_W1",
   "infer_step_param_type", "compute_parametric_overlap", "compute_state_overlap",
-  "aggregate_hmm_results",
-  "create_density_plot",
-  "run_one_scenario"
+  "aggregate_hmm_results", "get_true_rem_values", "aggregate_rem_results",
+  "build_rem_uncertainty_summary",
+  "create_density_plot", "finalize_config_results", "combine_task_results",
+  "run_replication_batch"
 ), envir = environment())
 
-# --- E: Run one config per worker ----------------------------------------------
-config_names_par <- names(run_configs)
+# --- E: Run one replication task per worker -------------------------------------
 cat("Starting", n_cores, "parallel workers...\n")
-out <- parallel::parLapply(cl, config_names_par, function(config_name) {
-  run_one_scenario(config_name, run_configs[[config_name]])
+out <- parallel::parLapply(cl, task_list, function(task) {
+  run_replication_batch(task$config_name, run_configs[[task$config_name]], task$iter_ids)
 })
-names(out) <- config_names_par
 out
 }, error = function(e) {
   message("PARALLEL ERROR: ", conditionMessage(e))
   message("Falling back to sequential execution...")
-  # Run sequentially so results are not lost
-  out <- list()
-  for (config_name in names(run_configs)) {
-    cat("  Running config:", config_name, "(sequential fallback)\n")
-    out[[config_name]] <- run_one_scenario(config_name, run_configs[[config_name]])
-  }
+  out <- lapply(task_list, function(task) {
+    cat("  Running config:", task$config_name, "rep", task$iter_ids, "(sequential fallback)\n")
+    run_replication_batch(task$config_name, run_configs[[task$config_name]], task$iter_ids)
+  })
   out
 }, finally = {
   try(parallel::stopCluster(cl), silent = TRUE)
@@ -1177,11 +1403,13 @@ out
 cat("All workers finished.\n")
 
 # Print each worker's captured log in scenario order
-for (.sn in names(results_list)) {
-  .log <- results_list[[.sn]]$log
+for (.sn in seq_along(task_results)) {
+  .log <- task_results[[.sn]]$log
   if (length(.log)) cat(.log, sep = "\n")
 }
 rm(.sn, .log)
+
+results_list <- combine_task_results(task_results)
 
 # --- F: Merge scenario-level lists into the shared master lists -----------------
 # unname() strips the outer scenario key so c() doesn't prefix element names
@@ -1202,11 +1430,13 @@ full_config_names <- names(run_configs)[vapply(run_configs, function(cfg) {
   identical(cfg$n_actors, 15) && identical(cfg$n_events, 3000)
 }, logical(1))]
 full_hmm_agg <- all_hmm_agg[full_config_names[full_config_names %in% names(all_hmm_agg)]]
+full_rem_agg <- all_rem_agg[full_config_names[full_config_names %in% names(all_rem_agg)]]
 # --- Validation: confirm merge produced actual data -----------------------------
 cat("\nMerge summary:\n")
 cat("  all_results    :", length(all_results),     "configs\n")
 cat("  all_hmm_agg    :", length(all_hmm_agg),    "configs\n")
 cat("  all_diagnostics:", length(all_diagnostics), "configs\n")
+cat("  all_rem_agg    :", length(all_rem_agg),    "configs\n")
 if (length(all_hmm_agg) == 0)
   warning("all_hmm_agg is empty after merge -- HMM sheets will be missing from Excel export.")
 
@@ -1257,6 +1487,20 @@ if (!RUN_HMM_REM) {
     overlap_summary <- combined_hmm %>% filter(States == 2) %>% select(all_of(overlap_avail))
     print(knitr::kable(overlap_summary, digits = 4, row.names = FALSE))
   }
+
+  rem_summary <- build_rem_uncertainty_summary(if (length(full_rem_agg) > 0) full_rem_agg else all_rem_agg)
+  if (!is.null(rem_summary) && nrow(rem_summary) > 0) {
+    cat("\n--- REM Uncertainty Calibration (HMREM Interaction Model) ---\n\n")
+    print(knitr::kable(
+      rem_summary %>%
+        select(Scenario, Variable, Estimate_mean, Empirical_SD, Reported_SE,
+               Coverage_95, SE_to_SD_ratio),
+      digits = 3,
+      row.names = FALSE,
+      col.names = c("Scenario", "Variable", "Mean Estimate", "Empirical SD",
+                    "Mean Reported SE", "Coverage 95", "SE / SD")
+    ))
+  }
   
   # Generate overlap bar chart
   p_ovl <- tryCatch(create_overlap_plot(all_hmm_agg), error = function(e) NULL)
@@ -1267,11 +1511,27 @@ if (!RUN_HMM_REM) {
   }
   
   cat("\nQuick analysis complete!\n")
+
+  save_analysis_bundle(
+    all_results = all_results,
+    all_hmm_agg = all_hmm_agg,
+    all_diagnostics = all_diagnostics,
+    all_rem_agg = all_rem_agg,
+    scenarios = scenarios,
+    run_configs = run_configs,
+    R = R,
+    n_actors = n_actors,
+    states_to_fit = states_to_fit,
+    tau1 = tau1,
+    tau2 = tau2,
+    RUN_HMM_REM = RUN_HMM_REM
+  )
   
   # Save results to global environment
   assign("all_hmm_agg", all_hmm_agg, envir = .GlobalEnv)
   assign("all_results", all_results, envir = .GlobalEnv)
   assign("all_diagnostics", all_diagnostics, envir = .GlobalEnv)
+  assign("all_rem_agg", all_rem_agg, envir = .GlobalEnv)
   assign("scenarios", scenarios, envir = .GlobalEnv)
   assign("run_configs", run_configs, envir = .GlobalEnv)
   assign("R", R, envir = .GlobalEnv)
@@ -1336,6 +1596,20 @@ if (length(overlap_avail) > 1) {
   print(knitr::kable(overlap_summary, digits = 4, row.names = FALSE))
 }
 
+rem_summary <- build_rem_uncertainty_summary(if (length(full_rem_agg) > 0) full_rem_agg else all_rem_agg)
+if (!is.null(rem_summary) && nrow(rem_summary) > 0) {
+  cat("\n--- REM Uncertainty Calibration (HMREM Interaction Model) ---\n\n")
+  print(knitr::kable(
+    rem_summary %>%
+      select(Scenario, Variable, Estimate_mean, Empirical_SD, Reported_SE,
+             Coverage_95, SE_to_SD_ratio),
+    digits = 3,
+    row.names = FALSE,
+    col.names = c("Scenario", "Variable", "Mean Estimate", "Empirical SD",
+                  "Mean Reported SE", "Coverage 95", "SE / SD")
+  ))
+}
+
 # -----------------------------------------------------------------------------
 # 9. Final Summary Table
 # -----------------------------------------------------------------------------
@@ -1391,6 +1665,21 @@ print(knitr::kable(diag_df, row.names = FALSE))
 
 cat("\n\nAnalysis complete!\n")
 
+save_analysis_bundle(
+  all_results = all_results,
+  all_hmm_agg = all_hmm_agg,
+  all_diagnostics = all_diagnostics,
+  all_rem_agg = all_rem_agg,
+  scenarios = scenarios,
+  run_configs = run_configs,
+  R = R,
+  n_actors = n_actors,
+  states_to_fit = states_to_fit,
+  tau1 = tau1,
+  tau2 = tau2,
+  RUN_HMM_REM = RUN_HMM_REM
+)
+
 # -----------------------------------------------------------------------------
 # 10. Save results to global environment for Excel export
 # -----------------------------------------------------------------------------
@@ -1399,6 +1688,7 @@ cat("\n\nAnalysis complete!\n")
 assign("all_hmm_agg", all_hmm_agg, envir = .GlobalEnv)
 assign("all_results", all_results, envir = .GlobalEnv)
 assign("all_diagnostics", all_diagnostics, envir = .GlobalEnv)
+assign("all_rem_agg", all_rem_agg, envir = .GlobalEnv)
 assign("scenarios", scenarios, envir = .GlobalEnv)
 assign("run_configs", run_configs, envir = .GlobalEnv)
 assign("R", R, envir = .GlobalEnv)

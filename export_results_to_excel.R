@@ -27,39 +27,56 @@ if (!exists("PACKAGES_LOADED_BY_RUNNER") || !PACKAGES_LOADED_BY_RUNNER) {
   }
 }
 
+load_analysis_bundle <- function(bundle_path) {
+  bundle <- readRDS(bundle_path)
+
+  if (!is.list(bundle)) {
+    stop("Analysis bundle must be a named list.")
+  }
+
+  required_names <- c(
+    "all_results", "all_hmm_agg", "all_diagnostics", "all_rem_agg",
+    "scenarios", "run_configs", "R", "n_actors", "states_to_fit",
+    "tau1", "tau2", "RUN_HMM_REM"
+  )
+  missing_names <- setdiff(required_names, names(bundle))
+  if (length(missing_names) > 0) {
+    stop(
+      "Analysis bundle is missing required objects: ",
+      paste(missing_names, collapse = ", ")
+    )
+  }
+
+  for (obj_name in names(bundle)) {
+    assign(obj_name, bundle[[obj_name]], envir = .GlobalEnv)
+  }
+}
+
 # -----------------------------------------------------------------------------
 # 2. Run the main analysis (source the scenarios script) if not already done
 # -----------------------------------------------------------------------------
 
-# Check if results already exist in workspace
-needs_run <- !exists("all_results") || !exists("run_configs")
+bundle_path <- "hmmrem_analysis_bundle.rds"
 
-# Also re-run if HMM results are missing (previous run may have crashed mid-way,
-# leaving stale all_results but no all_hmm_agg)
-if (!needs_run) {
-  hmm_present <- exists("all_hmm_agg") && length(all_hmm_agg) > 0 &&
-    length(Filter(function(x) !is.null(x) && nrow(x) > 0, all_hmm_agg)) > 0
-  if (!hmm_present) {
-    cat("NOTE: all_results exists but all_hmm_agg is missing or empty.\n")
-    cat("      Re-running HMMREM_scenarios.R to regenerate all results.\n\n")
-    needs_run <- TRUE
-  }
-}
-
-if (needs_run) {
-  cat("Running HMMREM Scenario Analysis...\n")
+if (!file.exists(bundle_path)) {
+  cat("Analysis bundle not found. Running HMMREM Scenario Analysis...\n")
   cat("This may take several minutes.\n\n")
-  
-  # Source the main analysis script
+
   source("HMMREM_scenarios.R")
-  
-  if (!exists("all_results")) {
-    stop("Analysis did not complete successfully. Please check HMMREM_scenarios.R for errors.")
+
+  if (!file.exists(bundle_path)) {
+    stop(
+      "Analysis completed without creating ",
+      bundle_path,
+      ". Please check ",
+      "HMMREM_scenarios.R",
+      " for bundle-saving errors."
+    )
   }
-} else {
-  cat("Using existing results from workspace.\n")
-  cat("If you want to re-run the analysis, restart R and run this script again.\n\n")
 }
+
+cat("Loading analysis bundle from:", normalizePath(bundle_path, winslash = "/"), "\n\n")
+load_analysis_bundle(bundle_path)
 
 # Check what results are available
 # HMM 2-state is ALWAYS fitted (even in quick mode), but require at least one non-empty aggregate
@@ -78,6 +95,53 @@ if (!hmm_available) {
       if (is.data.frame(all_hmm_agg[[1]])) cat("  DEBUG: nrow of first entry  =", nrow(all_hmm_agg[[1]]), "\n")
     }
   }
+}
+
+rem_available <- FALSE
+if (exists("all_rem_agg") && length(all_rem_agg) > 0) {
+  valid_rem_agg <- Filter(function(x) !is.null(x) && length(x) > 0, all_rem_agg)
+  rem_available <- length(valid_rem_agg) > 0
+}
+
+extract_rem_uncertainty <- function(all_rem_agg, run_configs) {
+  if (!exists("all_rem_agg") || length(all_rem_agg) == 0) return(data.frame())
+
+  rows <- lapply(names(all_rem_agg), function(config_name) {
+    config_res <- all_rem_agg[[config_name]]
+    if (is.null(config_res) || length(config_res) == 0) return(NULL)
+
+    model_rows <- lapply(names(config_res), function(model_name) {
+      model_res <- config_res[[model_name]]
+      coef_df <- model_res$coefficients
+      if (is.null(coef_df) || nrow(coef_df) == 0) return(NULL)
+
+      data.frame(
+        Config = config_name,
+        Scenario = run_configs[[config_name]]$scenario_name,
+        T = run_configs[[config_name]]$n_events,
+        N = run_configs[[config_name]]$n_actors,
+        Model = model_name,
+        Variable = coef_df$Variable,
+        Estimate_mean = coef_df$Estimate_mean,
+        Empirical_SD = coef_df$Estimate_sd,
+        Reported_SE = coef_df$SE_mean,
+        Coverage_95 = coef_df$Coverage_95,
+        SE_to_SD_ratio = coef_df$SE_to_SD_ratio,
+        SD_to_SE_ratio = coef_df$SD_to_SE_ratio,
+        sig_rate = coef_df$sig_rate,
+        BIC_mean = model_res$bic_mean,
+        BIC_sd = model_res$bic_sd
+      )
+    })
+
+    model_rows <- Filter(Negate(is.null), model_rows)
+    if (length(model_rows) == 0) return(NULL)
+    do.call(rbind, model_rows)
+  })
+
+  rows <- Filter(Negate(is.null), rows)
+  if (length(rows) == 0) return(data.frame())
+  do.call(rbind, rows)
 }
 # -----------------------------------------------------------------------------
 # 3. Prepare data for Excel export
@@ -103,7 +167,7 @@ summary_info <- data.frame(
             if (exists("RUN_HMM_REM") && RUN_HMM_REM) paste(states_to_fit, collapse = ", ") else "2", tau1, tau2,
             paste(names(scenarios), collapse = ", "),
             paste(length(run_configs), "total"),
-            "Disabled")
+            if (rem_available) paste(unique(unlist(lapply(Filter(function(x) !is.null(x) && length(x) > 0, all_rem_agg), names))), collapse = ", ") else "None")
 )
 
 writeData(wb, "Summary", summary_info, startRow = 1, startCol = 1)
@@ -247,8 +311,33 @@ if (length(existing_overlap_cols) > 0) {
   cat("  No HMM results available. Sheets 4-6 (HMM_Results, Confidence_Metrics, State_Overlap) skipped.\n")
 }
 
-cat("  REM fitting is disabled.\n")
-cat("  Model_Selection and REM_* sheets are skipped.\n")
+if (rem_available) {
+  addWorksheet(wb, "REM_Uncertainty")
+  rem_uncertainty_df <- extract_rem_uncertainty(all_rem_agg, run_configs)
+
+  if (nrow(rem_uncertainty_df) > 0) {
+    writeData(wb, "REM_Uncertainty", rem_uncertainty_df, startRow = 1, startCol = 1)
+
+    if ("SE_to_SD_ratio" %in% colnames(rem_uncertainty_df)) {
+      ratio_col <- which(colnames(rem_uncertainty_df) == "SE_to_SD_ratio")
+      conditionalFormatting(
+        wb, "REM_Uncertainty",
+        cols = ratio_col,
+        rows = 2:(nrow(rem_uncertainty_df) + 1),
+        type = "colourScale",
+        style = c("#F8696B", "#FFEB84", "#63BE7B")
+      )
+    }
+  } else {
+    writeData(
+      wb, "REM_Uncertainty",
+      data.frame(Note = "REM results object exists, but no uncertainty summary rows were available."),
+      startRow = 1, startCol = 1
+    )
+  }
+} else {
+  cat("  No REM uncertainty results available. REM_Uncertainty sheet skipped.\n")
+}
 
 # -----------------------------------------------------------------------------
 # Save Excel file
@@ -274,7 +363,13 @@ if (hmm_available) {
   cat("  6. State_Overlap - State overlap diagnostics (2-state model)\n")
 }
 
+if (rem_available) {
+  cat("  7. REM_Uncertainty - Empirical SD vs reported SE for second-stage REM estimates\n")
+}
+
 if (!hmm_available) {
   cat("  (No HMM results: sheets 4-6 skipped)\n")
 }
-cat("  (REM-related sheets disabled)\n")
+if (!rem_available) {
+  cat("  (No REM uncertainty results: REM sheet skipped)\n")
+}
