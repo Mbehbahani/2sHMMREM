@@ -1,10 +1,8 @@
 # Two-Stage HMREM Model for Relational Event Data
 
-This repository contains simulation, case-study, and reporting scripts for a
-two-stage Hidden Markov Model - Relational Event Model (HMMREM/HMREM) workflow.
-The code is designed to evaluate how well latent behavioral states can be
-recovered from relational event sequences and how those state assignments affect
-second-stage REM estimates.
+R research workflows combining Hidden Markov Models and relational event models, with simulation, uncertainty diagnostics and reproducible reports.
+
+The workflow studies how latent behavioural states can be recovered from relational events and how those state assignments affect second-stage REM estimates.
 
 ## Overview
 
@@ -50,7 +48,6 @@ RUN_HMM_REM <- TRUE
 | `3stateHMREM.Rmd` | Earlier 3-state HMREM simulation and analysis notebook. |
 | `Apollo2StateCase.Rmd` | Apollo 13 case-study notebook. |
 | `predictive_performance.Rmd` | In-sample and out-of-sample REM predictive performance helpers. |
-| `HMMREM_analysis.md` | Technical documentation for the scenario-analysis methodology. |
 
 ## Diagnostics Added in Recent Updates
 
@@ -162,6 +159,4 @@ your default CRAN setup.
 
 ## Project Status
 
-The repository currently tracks both `origin/master` and `origin/main`.
-Recent updates focused on the scenario-analysis scripts, Excel export, REM
-uncertainty calculations, state-overlap diagnostics, and regenerated plot formats.
+The default branch is `main`. The repository contains R simulation and analysis scripts, diagnostics and reporting utilities. Generated results depend on the scenario configuration and packages used; record those settings when comparing runs.
